@@ -1,0 +1,45 @@
+# Local production-shaped stack.
+#
+# The application mounts the Docker socket so it can start disposable sandbox
+# containers for repository checks. That is a genuine privilege escalation path
+# — socket access is effectively host root — and is acceptable only because this
+# file is for local use. In a real deployment, run sandbox execution on separate
+# workers with their own isolated runtime (see docs/deployment.md).
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_PERSONAL_ACCESS_TOKEN:-}
+      READ_LOOP_MODEL: ${READ_LOOP_MODEL:-gpt-5.4-mini}
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:?FLASK_SECRET_KEY is required}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CONVERSATION_STORE: sqlite
+      DATABASE_URL: sqlite:////data/app.db
+      WORKSPACE_ROOT: /data/workspaces
+      SANDBOX_MODE: docker
+      SANDBOX_IMAGE: python:3.12-slim
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
+      DAILY_COST_LIMIT_USD: ${DAILY_COST_LIMIT_USD:-10.0}
+    volumes:
+      - app-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  app-data:

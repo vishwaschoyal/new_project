@@ -1,0 +1,666 @@
+"""The hand-written agent loop.
+
+This is the whole control flow of the product, written out plainly. There is no
+framework driving it: the application sends messages, reads native tool calls,
+validates them, runs tools, appends observations, decides when to compact, and
+decides when to stop.
+
+That ownership is the point. Every expensive or dangerous decision — spend more
+tokens, read another range, delegate, edit a file, finalise — is a branch you
+can read here, not behaviour configured into a graph.
+
+Loop shape, once per step:
+
+    build messages (cacheable prefix + history + question + context block)
+        -> check budget; finalise early if the next call would not fit
+        -> stream one model response
+        -> no tool calls?  -> validate citations, finish
+        -> tool calls?     -> validate, dispatch, record evidence, append
+        -> compact old observations if the context has grown
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
+
+from agents import prompts
+from agents.evidence import Citation, EvidenceLedger, EvidenceRecord
+from agents.investigation_state import InvestigationState
+from config import LIMITS, READ_LOOP_MODEL, create_read_loop_model
+from services import cost_service
+from services.cost_service import Usage
+from tools.base import ToolResult
+from tools.registry import Capability, ToolRegistry
+
+log = logging.getLogger(__name__)
+
+# How much of a tool observation stays in the working context. Beyond this the
+# useful part has already been captured as evidence.
+MAX_OBSERVATION_CHARS = 4_000
+# Compact once the raw observations dominate the context.
+COMPACTION_TRIGGER_CHARS = 24_000
+# Never compact the most recent observations — the model is still using them.
+KEEP_RECENT_OBSERVATIONS = 4
+
+
+# --------------------------------------------------------------------------
+# Loop-owned tools
+# --------------------------------------------------------------------------
+# These are not repository tools; they mutate the loop's own state, so the
+# orchestrator handles them directly rather than routing through ToolRegistry.
+RECORD_FINDING_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "record_finding",
+        "description": (
+            "Record something you have established, with the exact lines that prove it. "
+            "Call this as soon as you establish a fact — raw tool output is compacted away "
+            "as the investigation grows, but recorded findings survive and become your "
+            "final answer's citations."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "claim": {
+                    "type": "string",
+                    "description": "One sentence stating what you established.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Repository-relative file path, exactly as the tools reported it.",
+                },
+                "start_line": {"type": "integer", "description": "First line proving the claim."},
+                "end_line": {"type": "integer", "description": "Last line proving the claim."},
+            },
+            "required": ["claim", "path", "start_line"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+ADD_QUESTION_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "add_question",
+        "description": (
+            "Register a sub-question you discovered that must be answered before the "
+            "original question is settled — for example a new hop in a call chain. Use "
+            "sparingly; each one costs budget."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The sub-question to answer."}
+            },
+            "required": ["question"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+# --------------------------------------------------------------------------
+# Events and result
+# --------------------------------------------------------------------------
+@dataclass
+class AgentEvent:
+    type: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+EventSink = Callable[[AgentEvent], None]
+
+
+def _null_sink(_event: AgentEvent) -> None:
+    pass
+
+
+@dataclass
+class ToolCallRecord:
+    step: int
+    name: str
+    arguments: dict[str, Any]
+    ok: bool
+    duration_ms: float
+    summary: str
+    truncated: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "name": self.name,
+            "arguments": self.arguments,
+            "ok": self.ok,
+            "duration_ms": self.duration_ms,
+            "summary": self.summary,
+            "truncated": self.truncated,
+        }
+
+
+@dataclass
+class AgentResult:
+    answer: str
+    citations: list[dict[str, Any]]
+    unsupported_citations: list[dict[str, Any]]
+    evidence: list[dict[str, Any]]
+    tool_calls: list[dict[str, Any]]
+    usage: dict[str, Any]
+    termination_reason: str
+    steps_used: int
+    wall_seconds: float
+    obligations: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "answer": self.answer,
+            "citations": self.citations,
+            "unsupported_citations": self.unsupported_citations,
+            "evidence": self.evidence,
+            "tool_calls": self.tool_calls,
+            "usage": self.usage,
+            "termination_reason": self.termination_reason,
+            "steps_used": self.steps_used,
+            "wall_seconds": self.wall_seconds,
+            "obligations": self.obligations,
+        }
+
+
+# --------------------------------------------------------------------------
+# Orchestrator
+# --------------------------------------------------------------------------
+class Orchestrator:
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        question: str,
+        repo_full_name: str = "",
+        branch: str = "",
+        history: Iterable[BaseMessage] = (),
+        capabilities: set[Capability] | None = None,
+        emit: EventSink = _null_sink,
+        max_steps: int = LIMITS.max_agent_steps,
+        token_budget: int = LIMITS.request_token_budget,
+        system_prompt: str | None = None,
+        ledger: EvidenceLedger | None = None,
+        name: str = "main",
+        allow_delegation: bool = False,
+    ):
+        self.workspace = Path(workspace)
+        self.question = question
+        self.repo_full_name = repo_full_name
+        self.branch = branch
+        self.history = list(history)
+        self.capabilities = capabilities or {Capability.READ}
+        self.emit = emit
+        self.max_steps = max_steps
+        self.token_budget = token_budget
+        self.name = name
+        self.allow_delegation = allow_delegation
+
+        self.registry = ToolRegistry(self.workspace, capabilities=self.capabilities)
+        self.ledger = ledger or EvidenceLedger()
+        self.state = InvestigationState(question)
+        self.usage = Usage(model=READ_LOOP_MODEL)
+        self.tool_trail: list[ToolCallRecord] = []
+
+        self.system_prompt = system_prompt or (
+            prompts.EDITING_SYSTEM_PROMPT
+            if Capability.EDIT in self.capabilities
+            else prompts.INVESTIGATION_SYSTEM_PROMPT
+        )
+
+        # Observations accumulate here and are compacted in place.
+        self._messages: list[BaseMessage] = []
+        self._steps_used = 0
+        self._started = time.perf_counter()
+        self._model = None  # built lazily so tests need no API key
+
+    # -- model -----------------------------------------------------------
+    @property
+    def model(self):
+        if self._model is None:
+            self._model = create_read_loop_model().bind_tools(self._tool_schemas())
+        return self._model
+
+    def _tool_schemas(self) -> list[dict[str, Any]]:
+        """Stable tool ordering — a reordered list breaks the cached prefix."""
+        schemas = self.registry.schemas()
+        schemas.append(RECORD_FINDING_SCHEMA)
+        schemas.append(ADD_QUESTION_SCHEMA)
+        if self.allow_delegation:
+            from agents.subagents import DELEGATE_SCHEMA
+
+            schemas.append(DELEGATE_SCHEMA)
+        return schemas
+
+    # -- message assembly ------------------------------------------------
+    def _build_messages(self, *, final_instruction: str | None = None) -> list[BaseMessage]:
+        """Assemble the request.
+
+        Order matters for caching: the invariant prefix (system prompt + tool
+        schemas, bound on the client) must come first and never change within a
+        run. History and the question follow. The volatile context block goes
+        last so it never invalidates the prefix.
+        """
+        messages: list[BaseMessage] = [SystemMessage(content=self.system_prompt)]
+        messages.extend(self.history)
+        messages.append(HumanMessage(content=self.question))
+        messages.extend(self._messages)
+
+        context = prompts.build_context_message(
+            repo_full_name=self.repo_full_name or "(unknown)",
+            branch=self.branch or "(unknown)",
+            obligations=self.state.render_status(),
+            evidence=self.ledger.render_for_prompt(),
+            observed=self.ledger.render_observed_files(),
+            steps_used=self._steps_used,
+            steps_total=self.max_steps,
+            tokens_used=self.usage.total_tokens,
+            token_budget=self.token_budget,
+        )
+        if final_instruction:
+            context += "\n\n" + final_instruction
+        messages.append(HumanMessage(content=context))
+        return messages
+
+    # -- budget ----------------------------------------------------------
+    def _budget_remaining(self) -> int:
+        return self.token_budget - self.usage.total_tokens
+
+    def _can_afford_another_step(self, messages: list[BaseMessage]) -> bool:
+        """Would the next call leave enough budget to still write an answer?
+
+        Estimated locally before sending, because discovering the overrun from
+        the provider's usage report means having already paid for it.
+        """
+        projected = cost_service.estimate_messages_tokens(messages, READ_LOOP_MODEL)
+        needed = projected + LIMITS.final_synthesis_reserve
+        return needed <= self._budget_remaining()
+
+    # -- the loop --------------------------------------------------------
+    def run(self) -> AgentResult:
+        termination = "answered"
+        answer = ""
+
+        try:
+            answer, termination = self._loop()
+        except Exception as exc:  # provider or transport failure
+            log.exception("agent loop failed", extra={"agent": self.name})
+            self.emit(AgentEvent("error", {"message": str(exc)}))
+            answer = self._best_effort_answer(str(exc))
+            termination = "provider_error"
+
+        verification = self.ledger.verify_answer(answer)
+        if verification["unsupported"]:
+            # Strip rather than silently keep: an unsupported citation is the
+            # failure this system exists to prevent.
+            answer = self._strip_unsupported(answer, verification["unsupported"])
+
+        result = AgentResult(
+            answer=answer,
+            citations=verification["supported"],
+            unsupported_citations=verification["unsupported"],
+            evidence=[record.to_dict() for record in self.ledger.records],
+            tool_calls=[record.to_dict() for record in self.tool_trail],
+            usage=self.usage.to_dict(),
+            termination_reason=termination,
+            steps_used=self._steps_used,
+            wall_seconds=round(time.perf_counter() - self._started, 2),
+            obligations=[o.to_dict() for o in self.state.obligations],
+        )
+        self.emit(AgentEvent("done", result.to_dict()))
+        return result
+
+    def _loop(self) -> tuple[str, str]:
+        while self._steps_used < self.max_steps:
+            messages = self._build_messages()
+
+            if not self._can_afford_another_step(messages):
+                log.info("token budget reached", extra={"agent": self.name})
+                return self._finalise(prompts.BUDGET_EXHAUSTED_INSTRUCTION), "token_budget"
+
+            self._steps_used += 1
+            self.emit(AgentEvent("step", {"step": self._steps_used, "total": self.max_steps}))
+
+            message = self._invoke(messages, stream=True)
+            tool_calls = getattr(message, "tool_calls", None) or []
+
+            if not tool_calls:
+                text = _text_of(message.content)
+
+                # An answer whose citations verify has already done what an
+                # obligation asks for, even if the model never called
+                # record_finding. Credit that before challenging, otherwise a
+                # well-cited one-part answer pays for a pointless extra step.
+                supported = self.ledger.verify_answer(text)["supported"]
+                if supported:
+                    self.state.resolve_best_match(
+                        answer=text,
+                        citations=[f"{c['path']}:{c['start_line']}" for c in supported],
+                    )
+
+                challenge = self.state.challenge_finalisation()
+                if challenge:
+                    # Premature finish: push back once with what is still open.
+                    self.emit(AgentEvent("challenge", {"message": challenge}))
+                    self._messages.append(AIMessage(content=text))
+                    self._messages.append(HumanMessage(content=challenge))
+                    continue
+                return text, ("answered" if self.state.is_complete else "answered_partial")
+
+            self._messages.append(message)
+            for call in tool_calls:
+                self._execute_tool_call(call)
+
+            self._compact_if_needed()
+
+        return self._finalise(prompts.FINALISE_INSTRUCTION), "step_limit"
+
+    # -- model invocation ------------------------------------------------
+    def _invoke(self, messages: list[BaseMessage], *, stream: bool) -> AIMessage:
+        if not stream:
+            response = self.model.invoke(messages)
+            self._account(response)
+            return response
+
+        aggregate = None
+        for chunk in self.model.stream(messages):
+            aggregate = chunk if aggregate is None else aggregate + chunk
+            delta = _text_of(chunk.content)
+            if delta:
+                self.emit(AgentEvent("content", {"delta": delta}))
+
+        if aggregate is None:
+            raise RuntimeError("The model returned an empty response.")
+        self._account(aggregate)
+        return aggregate
+
+    def _account(self, response: Any) -> None:
+        usage = cost_service.usage_from_response(response, READ_LOOP_MODEL)
+        self.usage.add(usage)
+        self.emit(
+            AgentEvent(
+                "usage",
+                {**self.usage.to_dict(), "agent": self.name, "step_cost_usd": usage.cost_usd},
+            )
+        )
+
+    # -- tool execution --------------------------------------------------
+    def _execute_tool_call(self, call: dict[str, Any]) -> None:
+        name = call.get("name") or ""
+        arguments = call.get("args") or {}
+        call_id = call.get("id") or ""
+
+        self.emit(AgentEvent("tool_start", {"tool": name, "arguments": arguments, "step": self._steps_used}))
+
+        if name == "record_finding":
+            result = self._handle_record_finding(arguments)
+        elif name == "add_question":
+            result = self._handle_add_question(arguments)
+        elif name == "delegate":
+            result = self._handle_delegate(arguments)
+        else:
+            repeat_warning = self.state.register_call(name, arguments)
+            if repeat_warning:
+                result = ToolResult.failure(name, repeat_warning, repeated=True)
+            else:
+                result = self.registry.dispatch(name, arguments)
+                if result.ok:
+                    self.ledger.observe_tool_result(name, result.metadata, result.content)
+
+        observation = result.to_model_string()
+        if len(observation) > MAX_OBSERVATION_CHARS:
+            observation = (
+                observation[:MAX_OBSERVATION_CHARS]
+                + "\n\n[observation trimmed — record what matters with record_finding]"
+            )
+
+        self._messages.append(ToolMessage(content=observation, tool_call_id=call_id, name=name))
+
+        record = ToolCallRecord(
+            step=self._steps_used,
+            name=name,
+            arguments=arguments,
+            ok=result.ok,
+            duration_ms=float(result.metadata.get("duration_ms", 0.0)),
+            summary=_summarise(result),
+            truncated=bool(result.metadata.get("truncated")),
+        )
+        self.tool_trail.append(record)
+        self.emit(AgentEvent("tool_end", record.to_dict()))
+
+    def _handle_record_finding(self, arguments: dict[str, Any]) -> ToolResult:
+        claim = str(arguments.get("claim") or "").strip()
+        path = str(arguments.get("path") or "").strip()
+        try:
+            start = int(arguments.get("start_line") or 0)
+            end = int(arguments.get("end_line") or start)
+        except (TypeError, ValueError):
+            return ToolResult.failure("record_finding", "start_line and end_line must be integers.")
+
+        if not claim or not path or start < 1:
+            return ToolResult.failure(
+                "record_finding", "claim, path, and a positive start_line are required."
+            )
+
+        citation = Citation(path, start, max(start, end))
+        stored = self.ledger.add(
+            EvidenceRecord(claim=claim, citation=citation, source=self.name)
+        )
+        if not stored:
+            # The whole honesty guarantee lives here: a finding can only be
+            # recorded against lines this request actually opened.
+            return ToolResult.failure(
+                "record_finding",
+                f"You have not read {path} lines {start}-{max(start, end)} in this "
+                f"investigation, so this finding cannot be recorded. Read that exact range "
+                f"first, then record it.",
+            )
+
+        resolved = self.state.resolve_best_match(answer=claim, citations=[str(citation)])
+        self.emit(
+            AgentEvent(
+                "finding",
+                {"claim": claim, "reference": str(citation), "source": self.name,
+                 "resolved_obligation": resolved},
+            )
+        )
+        remaining = len(self.state.open_obligations)
+        return ToolResult.success(
+            "record_finding",
+            f"Recorded: {claim} ({citation}). "
+            + (f"{remaining} part(s) of the question still open." if remaining else
+               "Every part of the question is now covered — answer unless something is genuinely unresolved."),
+        )
+
+    def _handle_add_question(self, arguments: dict[str, Any]) -> ToolResult:
+        question = str(arguments.get("question") or "").strip()
+        added = self.state.add_obligation(question)
+        if not added:
+            return ToolResult.failure(
+                "add_question",
+                "Could not add that question — it is too short, a duplicate, or the limit is reached.",
+            )
+        return ToolResult.success("add_question", f"Tracking: {question}")
+
+    def _handle_delegate(self, arguments: dict[str, Any]) -> ToolResult:
+        from agents.subagents import run_delegation
+
+        return run_delegation(self, arguments)
+
+    # -- compaction ------------------------------------------------------
+    def _compact_if_needed(self) -> None:
+        """Replace old raw observations with a pointer to recorded evidence.
+
+        Only ToolMessages are compacted, and only ones the model has moved past.
+        The assistant's own reasoning stays: it is small and it is the thread of
+        the investigation. What grows without bound is tool output, and by this
+        point its answer-relevant content is already in the ledger.
+        """
+        total = sum(len(str(m.content)) for m in self._messages)
+        if total <= COMPACTION_TRIGGER_CHARS:
+            return
+
+        tool_indices = [
+            index for index, message in enumerate(self._messages)
+            if isinstance(message, ToolMessage) and not _is_compacted(message)
+        ]
+        compactable = tool_indices[:-KEEP_RECENT_OBSERVATIONS] if len(tool_indices) > KEEP_RECENT_OBSERVATIONS else []
+
+        freed = 0
+        for index in compactable:
+            message = self._messages[index]
+            original = len(str(message.content))
+            self._messages[index] = ToolMessage(
+                content=(
+                    f"[compacted: {message.name or 'tool'} output removed to save context. "
+                    f"Anything you recorded with record_finding is preserved above.]"
+                ),
+                tool_call_id=message.tool_call_id,
+                name=message.name,
+            )
+            freed += original
+
+        if freed:
+            log.info(
+                "compacted context",
+                extra={"agent": self.name, "freed_chars": freed, "messages": len(compactable)},
+            )
+            self.emit(AgentEvent("compaction", {"freed_chars": freed, "observations": len(compactable)}))
+
+    # -- finalisation ----------------------------------------------------
+    def _finalise(self, instruction: str) -> str:
+        """One last non-tool call to turn recorded evidence into an answer."""
+        self.emit(AgentEvent("finalising", {"reason": instruction.split("\n", 1)[0]}))
+        messages = self._build_messages(final_instruction=instruction)
+        try:
+            # Unbound client: finalisation must produce prose, not another tool call.
+            final_model = create_read_loop_model()
+            aggregate = None
+            for chunk in final_model.stream(messages):
+                aggregate = chunk if aggregate is None else aggregate + chunk
+                delta = _text_of(chunk.content)
+                if delta:
+                    self.emit(AgentEvent("content", {"delta": delta}))
+            if aggregate is None:
+                return self._best_effort_answer("The model returned nothing.")
+            self._account(aggregate)
+            return _text_of(aggregate.content)
+        except Exception as exc:
+            log.exception("finalisation failed", extra={"agent": self.name})
+            return self._best_effort_answer(str(exc))
+
+    def _best_effort_answer(self, reason: str) -> str:
+        """Assemble an answer from evidence alone when the model is unavailable.
+
+        The user paid for the investigation that produced these findings; losing
+        them to a provider error would waste that entirely.
+        """
+        records = self.ledger.records
+        if not records:
+            return (
+                f"I could not complete this investigation: {reason}\n\n"
+                "No verified findings were recorded, so there is nothing to report."
+            )
+        lines = [
+            f"I could not complete the final synthesis ({reason}), but the "
+            "investigation established the following:",
+            "",
+        ]
+        lines += [f"- {record.claim} ({record.citation})" for record in records]
+        outstanding = self.state.open_obligations
+        if outstanding:
+            lines += ["", "Still unresolved:"]
+            lines += [f"- {o.question}" for o in outstanding]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _strip_unsupported(answer: str, unsupported: list[dict[str, Any]]) -> str:
+        cleaned = answer
+        for citation in unsupported:
+            reference = (
+                f"{citation['path']}:{citation['start_line']}"
+                + (f"-{citation['end_line']}" if citation["end_line"] > citation["start_line"] else "")
+            )
+            cleaned = cleaned.replace(f"({reference})", "").replace(reference, "")
+        note = (
+            "\n\n_Note: one or more citations in this answer referred to lines that were "
+            "not read during this investigation and have been removed._"
+        )
+        return cleaned.rstrip() + note
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+def _text_of(content: Any) -> str:
+    """Flatten message content to text.
+
+    The Responses API returns a list of typed blocks; older shapes return a
+    plain string. Reasoning blocks are skipped — they are not the answer.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") in (None, "text", "output_text"):
+                    parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _is_compacted(message: ToolMessage) -> bool:
+    return str(message.content).startswith("[compacted:")
+
+
+def _summarise(result: ToolResult, *, limit: int = 160) -> str:
+    """One line for the user-visible tool trail."""
+    if not result.ok:
+        return result.content[:limit]
+    metadata = result.metadata
+    if result.tool == "grep":
+        return f"{metadata.get('matches', 0)} match(es) for {metadata.get('pattern', '')!r}"
+    if result.tool == "glob":
+        return f"{metadata.get('count', 0)} file(s)"
+    if result.tool == "read":
+        return f"{metadata.get('path', '')} lines {metadata.get('start_line')}-{metadata.get('end_line')}"
+    if result.tool == "edit":
+        return f"edited {metadata.get('path', '')} at line {metadata.get('line')}"
+    first_line = result.content.split("\n", 1)[0]
+    return first_line[:limit]
+
+
+def messages_from_history(history: Iterable[Any]) -> list[BaseMessage]:
+    """Convert stored turns into model messages for the cacheable prefix."""
+    converted: list[BaseMessage] = []
+    for message in history:
+        role = getattr(message, "role", None) or (message.get("role") if isinstance(message, dict) else None)
+        content = getattr(message, "content", None) or (
+            message.get("content") if isinstance(message, dict) else ""
+        )
+        if not content:
+            continue
+        converted.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
+    return converted
+
+
+def serialise_event(event: AgentEvent) -> str:
+    return json.dumps({"type": event.type, **event.data}, default=str)
