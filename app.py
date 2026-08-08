@@ -78,12 +78,13 @@ def _startup_banner(host: str, port: int) -> str:
     configuration that silently changes behaviour — the model being billed, and
     whether repository code actually runs isolated.
     """
-    from config import READ_LOOP_MODEL, SETTINGS
+    from config import READ_LOOP_MODEL, SETTINGS, synced_folder
     from services.sandbox_service import active_backend, sandbox_available
 
     url = f"http://{'127.0.0.1' if host in {'0.0.0.0', ''} else host}:{port}"
     backend = active_backend()
     isolated = backend == "docker" and sandbox_available()
+    sync_client = synced_folder(SETTINGS.workspace_root)
 
     lines = [
         "",
@@ -93,8 +94,14 @@ def _startup_banner(host: str, port: int) -> str:
         f"  model    {READ_LOOP_MODEL}" + ("" if SETTINGS.model_configured else "   (no OPENAI_API_KEY!)"),
         f"  store    {SETTINGS.conversation_store}",
         f"  sandbox  {backend}" + ("  (isolated)" if isolated else "  (NOT isolated)"),
+        f"  clones   {SETTINGS.workspace_root}",
         "",
     ]
+
+    if sync_client:
+        lines.append(f"  ! Clones are stored inside {sync_client}, which breaks git at random")
+        lines.append("    and uploads every cloned repo to your cloud quota.")
+        lines.append("    Set WORKSPACE_ROOT in .env to a path outside it.")
 
     # ASCII only below: the Windows console is cp1252 and turns an em-dash into
     # a replacement character.

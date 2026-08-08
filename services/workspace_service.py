@@ -18,6 +18,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,45 @@ from services.github_service import RepoRef
 log = logging.getLogger(__name__)
 
 _THREAD_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
+
+# Filesystem errors that mean "something else was holding the file", not
+# "this repository cannot be cloned". Worth exactly one retry.
+_TRANSIENT_CLONE_ERRORS = (
+    "could not lock config file",
+    "no such file or directory",
+    "permission denied",
+    "access is denied",
+    "unable to create",
+    "file exists",
+    "resource temporarily unavailable",
+)
+
+
+def _looks_transient(error_text: str) -> bool:
+    lowered = (error_text or "").lower()
+    # Auth and network failures share some wording but never recover on retry.
+    if any(
+        fatal in lowered
+        for fatal in ("authentication failed", "repository not found", "could not resolve host")
+    ):
+        return False
+    return any(marker in lowered for marker in _TRANSIENT_CLONE_ERRORS)
+
+
+def _clone_error_message(error_text: str, workspace_root: Path) -> str:
+    """Turn a git failure into something the user can act on."""
+    from config import synced_folder
+
+    message = f"Clone failed: {error_text}"
+    client = synced_folder(workspace_root)
+
+    if client and _looks_transient(error_text):
+        message += (
+            f"\n\nThe workspace directory is inside {client}, which opens handles on "
+            f"files as git creates them and makes clones fail at random. Set "
+            f"WORKSPACE_ROOT in .env to a path outside {client} and restart."
+        )
+    return message
 
 
 def validate_thread_id(thread_id: str) -> str:
@@ -118,9 +158,22 @@ class WorkspaceService:
         destination = thread_dir / ref.name
 
         result = git_service.clone(ref.clone_url, destination, token=GITHUB_TOKEN or None)
+
+        if not result.ok and _looks_transient(result.stderr or result.stdout):
+            # A sync client or scanner held a handle while git was writing. The
+            # partial clone is unusable, so start from a clean directory rather
+            # than letting git resume into it.
+            log.warning(
+                "clone hit a transient filesystem error; retrying once",
+                extra={"thread_id": thread_id, "repo": ref.full_name},
+            )
+            self._remove_tree(thread_dir)
+            time.sleep(1.0)
+            result = git_service.clone(ref.clone_url, destination, token=GITHUB_TOKEN or None)
+
         if not result.ok:
             self._remove_tree(thread_dir)
-            raise WorkspaceError(f"Clone failed: {result.stderr or result.stdout}")
+            raise WorkspaceError(_clone_error_message(result.stderr or result.stdout, self.root))
 
         branch = git_service.current_branch(destination)
         workspace = Workspace(
@@ -180,7 +233,21 @@ class WorkspaceService:
             except OSError:
                 log.warning("could not remove path", extra={"path": str(path)})
 
-        shutil.rmtree(resolved, onerror=_on_error)
+        # Windows keeps a directory name in "delete pending" while any process
+        # still holds a handle to something inside it — a sync client, antivirus,
+        # or an open editor. Recreating that exact path immediately then fails in
+        # confusing ways, including ENOENT for files created inside it.
+        #
+        # Renaming first is atomic and frees the original name at once. If the
+        # subsequent delete then fails, the cost is a leaked directory rather
+        # than a broken clone.
+        doomed = resolved.with_name(f"{resolved.name}.deleting-{uuid.uuid4().hex[:8]}")
+        try:
+            resolved.rename(doomed)
+        except OSError:
+            doomed = resolved
+
+        shutil.rmtree(doomed, onerror=_on_error)
 
     def switch_branch(self, thread_id: str, branch: str) -> Workspace:
         """Human-requested branch switch. Refuses to discard uncommitted work."""

@@ -160,6 +160,49 @@ LIMITS = Limits()
 
 
 # --------------------------------------------------------------------------
+# Workspace location
+# --------------------------------------------------------------------------
+# Cloud-sync clients fight git over `.git` internals. They open handles on files
+# the moment they appear, and a clone creates hundreds of small files fast, so
+# git's attempt to lock `.git/config` fails with "could not lock config file:
+# No such file or directory" — intermittently, which makes it look like a bug in
+# this application rather than in the folder it was told to write to.
+SYNC_CLIENT_MARKERS: tuple[str, ...] = ("onedrive", "dropbox", "google drive", "icloud")
+
+
+def synced_folder(path: Path) -> str | None:
+    """Name of the sync client whose folder ``path`` sits inside, if any."""
+    lowered = str(path).lower()
+    for marker in SYNC_CLIENT_MARKERS:
+        if marker in lowered:
+            return marker.title().replace(" ", "")
+    return None
+
+
+def _default_workspace_root() -> Path:
+    """Where cloned repositories live.
+
+    Deliberately *not* inside the project directory. On Windows a project often
+    sits under OneDrive, which breaks clones as described above — and cloned
+    repositories are large, disposable caches, so uploading them to someone's
+    cloud storage quota is a second bug on top of the first.
+
+    Set WORKSPACE_ROOT to override; a relative value is resolved against the
+    project directory.
+    """
+    override = _str("WORKSPACE_ROOT")
+    if override:
+        candidate = Path(override)
+        return candidate.resolve() if candidate.is_absolute() else (BASE_DIR / candidate).resolve()
+
+    if os.name == "nt":
+        base = os.getenv("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.getenv("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return Path(base, "ai-coding-workspace", "workspaces").resolve()
+
+
+# --------------------------------------------------------------------------
 # Application settings
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
@@ -168,9 +211,7 @@ class Settings:
         default_factory=lambda: _str("FLASK_SECRET_KEY", "dev-insecure-key")
     )
     log_level: str = field(default_factory=lambda: _str("LOG_LEVEL", "INFO").upper())
-    workspace_root: Path = field(
-        default_factory=lambda: (BASE_DIR / _str("WORKSPACE_ROOT", "workspaces")).resolve()
-    )
+    workspace_root: Path = field(default_factory=_default_workspace_root)
 
     conversation_store: str = field(
         default_factory=lambda: _str("CONVERSATION_STORE", "sqlite").lower()
