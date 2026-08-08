@@ -228,3 +228,65 @@ class TestBrowserRendering:
         step cannot reintroduce markup."""
         assert "createTreeWalker" in app_js
         assert "NodeFilter.SHOW_TEXT" in app_js
+
+
+class TestHiddenElements:
+    """The `hidden` attribute must actually hide.
+
+    Regression: `.modal`, `.task-bar`, and `.panel-grow` all set `display: flex`,
+    which beat the UA stylesheet's `[hidden] { display: none }`. The empty modal,
+    an inactive task bar, and an empty file tree were all painted on load.
+    """
+
+    @pytest.fixture
+    def css(self) -> str:
+        return (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+    @pytest.fixture
+    def app_js(self) -> str:
+        return (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    def test_hidden_override_exists(self, css: str):
+        assert re.search(
+            r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important", css
+        ), "style.css must force [hidden] to display:none !important"
+
+    def test_nothing_else_uses_important_display(self, css: str):
+        """Only the [hidden] rule may use !important on display — anything else
+        would be able to out-rank it again."""
+        offenders = [
+            match.group(0)
+            for match in re.finditer(r"[^{}]+\{[^}]*display:[^;}]*!important[^}]*\}", css)
+            if "[hidden]" not in match.group(0)
+        ]
+        assert not offenders, f"these rules could defeat [hidden]: {offenders}"
+
+    # Elements that legitimately start visible, with the reason.
+    VISIBLE_ON_LOAD = {
+        "empty-state": "the welcome screen, shown until the first message",
+        "repo-picker": "the load-a-repository form, shown until a repo is loaded",
+    }
+
+    def test_elements_toggled_from_js_are_hidden_in_markup(self, app_js: str):
+        """Anything JS reveals conditionally must start hidden in the template,
+        or it is painted on load before the first toggle runs — which is exactly
+        how the empty modal and the inactive task bar reached the screen."""
+        html = (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+
+        toggled = set(re.findall(r"el\.(\w+)\.hidden\s*=", app_js))
+        element_ids = dict(re.findall(r"(\w+):\s*\$\(\"([\w-]+)\"\)", app_js))
+
+        checked = 0
+        for name in sorted(toggled):
+            element_id = element_ids.get(name)
+            if not element_id or element_id in self.VISIBLE_ON_LOAD:
+                continue
+            tag = re.search(rf'id="{re.escape(element_id)}"[^>]*>', html)
+            assert tag, f"#{element_id} is toggled from JS but not found in index.html"
+            assert "hidden" in tag.group(0), (
+                f"#{element_id} is toggled from JS but does not start hidden"
+            )
+            checked += 1
+
+        # Guard the guard: a broken regex would make this vacuously pass.
+        assert checked >= 3, f"expected to check several toggled elements, checked {checked}"

@@ -34,6 +34,12 @@ html, body {
 
 button, input, select, textarea { font: inherit; color: inherit; }
 
+/* The `hidden` attribute is only `display: none` in the UA stylesheet, so any
+ * author `display` rule silently beats it. Several elements below set
+ * `display: flex` and are toggled from JS via `.hidden` — without this they
+ * stay on screen forever. Keep this rule above them and keep the !important. */
+[hidden] { display: none !important; }
+
 /* ── layout ─────────────────────────────────────────────────────────── */
 .layout { display: grid; grid-template-columns: 310px 1fr; height: 100vh; }
 
