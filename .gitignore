@@ -1,0 +1,35 @@
+# Secrets — never commit
+.env
+.env.local
+*.pem
+*.key
+
+# Managed repository workspaces (cloned user repos)
+workspaces/
+instance/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts
+logs/
+*.log
+benchmarks/results/
