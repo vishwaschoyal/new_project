@@ -70,5 +70,53 @@ def create_app(**overrides) -> Flask:
 app = create_app()
 
 
+def _startup_banner(host: str, port: int) -> str:
+    """What the operator needs to know before the first request.
+
+    Flask's own "Running on ..." line is suppressed because werkzeug is pinned
+    to WARNING in configure_logging, so the URL is printed here. The rest is the
+    configuration that silently changes behaviour — the model being billed, and
+    whether repository code actually runs isolated.
+    """
+    from config import READ_LOOP_MODEL, SETTINGS
+    from services.sandbox_service import active_backend, sandbox_available
+
+    url = f"http://{'127.0.0.1' if host in {'0.0.0.0', ''} else host}:{port}"
+    backend = active_backend()
+    isolated = backend == "docker" and sandbox_available()
+
+    lines = [
+        "",
+        "  AI Coding Workspace",
+        f"  ---> {url}",
+        "",
+        f"  model    {READ_LOOP_MODEL}" + ("" if SETTINGS.model_configured else "   (no OPENAI_API_KEY!)"),
+        f"  store    {SETTINGS.conversation_store}",
+        f"  sandbox  {backend}" + ("  (isolated)" if isolated else "  (NOT isolated)"),
+        "",
+    ]
+
+    # ASCII only below: the Windows console is cp1252 and turns an em-dash into
+    # a replacement character.
+    if not SETTINGS.model_configured:
+        lines.append("  ! OPENAI_API_KEY is not set - every run will fail.")
+    if not isolated:
+        lines.append("  ! Repository checks run without container isolation.")
+        lines.append("    Start Docker Desktop for a real sandbox. Ask mode is unaffected;")
+        lines.append("    it never executes repository code.")
+    if SETTINGS.auth_enabled is False:
+        lines.append("  ! AUTH_ENABLED=false - every visitor shares one identity and quota.")
+        lines.append("    Fine locally, not for anything reachable from the internet.")
+
+    lines += ["", "  Ctrl+C to stop.", ""]
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
+    import os
+
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "5000"))
+
+    print(_startup_banner(host, port), flush=True)
+    app.run(host=host, port=port, debug=False, threaded=True)
