@@ -59,7 +59,7 @@
       return `<pre class="plain">${escapeHtml(text)}</pre>`;
     }
     const html = window.marked.parse(String(text ?? ""), { breaks: true, gfm: true });
-    return window.DOMPurify.sanitize(html, {
+    const clean = window.DOMPurify.sanitize(html, {
       ALLOWED_TAGS: ["p", "br", "strong", "em", "code", "pre", "ul", "ol", "li", "a",
                      "h1", "h2", "h3", "h4", "blockquote", "table", "thead", "tbody",
                      "tr", "th", "td", "hr", "del", "span"],
@@ -67,6 +67,46 @@
       // Model text can contain a javascript: or data: URI lifted from a repo.
       ALLOWED_URI_REGEXP: /^(?:https?:|mailto:|#)/i,
     });
+    return neutraliseLinks(clean);
+  }
+
+  /* Strip click-through from links in model output.
+   *
+   * The model has just been reading an arbitrary repository, and a file can
+   * contain a URL planted to be relayed to you as if the assistant vouched for
+   * it. DOMPurify blocks javascript: and data:, but an ordinary https:// link
+   * to anywhere survives — and a phishing link is dangerous precisely because
+   * it looks ordinary.
+   *
+   * So the URL is shown in full and made inert. No information is lost; you can
+   * still read and copy it, but you cannot click a destination you did not
+   * inspect. Citation links are added later, after this runs, and stay live
+   * because they only open files in this workspace. */
+  function neutraliseLinks(sanitizedHtml) {
+    const holder = document.createElement("template");
+    holder.innerHTML = sanitizedHtml;      // already sanitized above
+
+    holder.content.querySelectorAll("a").forEach((anchor) => {
+      const href = (anchor.getAttribute("href") || "").trim();
+      const label = anchor.textContent.trim();
+
+      const span = document.createElement("span");
+      span.className = "ext-link";
+      span.title = "Link found in model output — shown in full, not clickable";
+      span.textContent = label || href;
+
+      // Only append the URL when it is not already the visible text, so a bare
+      // link is not printed twice.
+      if (href && href !== label && !href.startsWith("#")) {
+        const url = document.createElement("span");
+        url.className = "ext-url";
+        url.textContent = ` (${href})`;
+        span.append(url);
+      }
+      anchor.replaceWith(span);
+    });
+
+    return holder.innerHTML;
   }
 
   function highlight(scope) {

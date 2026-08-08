@@ -63,7 +63,7 @@ READ_LOOP_MODEL = _str("READ_LOOP_MODEL", DEFAULT_READ_LOOP_MODEL)
 # Bumping this key deliberately invalidates the provider-side prompt cache.
 # Change it whenever the system prompt or tool schemas change, otherwise the
 # provider may serve a prefix that no longer matches what we send.
-READ_LOOP_PROMPT_CACHE_KEY = "read-loop-system-tools-v1"
+READ_LOOP_PROMPT_CACHE_KEY = "read-loop-system-tools-v2"
 READ_LOOP_PROMPT_CACHE_RETENTION = "24h"
 READ_LOOP_MAX_OUTPUT_TOKENS = 3_000
 
