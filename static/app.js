@@ -245,6 +245,7 @@
       repositories.forEach((repo) => {
         const item = document.createElement("li");
         item.innerHTML = `<strong>${escapeHtml(repo.name)}</strong>
+          ${repo.private ? '<span class="repo-private">private</span>' : ""}
           <span class="repo-lang">${escapeHtml(repo.language || "")}</span>
           <span class="repo-stars">★ ${repo.stars}</span>`;
         item.addEventListener("click", () => loadRepository(repo.html_url));

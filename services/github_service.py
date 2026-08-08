@@ -154,8 +154,47 @@ def fetch_profile(username: str) -> dict[str, Any]:
     }
 
 
+_authenticated_login: str | None | object = None
+_UNRESOLVED = object()
+
+
+def authenticated_login() -> str | None:
+    """Login of the token's owner, or None when no usable token is set.
+
+    Cached for the process: it cannot change without a restart, and this is
+    consulted on every repository listing.
+    """
+    global _authenticated_login
+    if _authenticated_login is not _UNRESOLVED and _authenticated_login is not None:
+        return _authenticated_login  # type: ignore[return-value]
+    if not GITHUB_TOKEN:
+        return None
+    try:
+        _authenticated_login = _get("/user").get("login")
+    except NotFoundError:
+        _authenticated_login = None
+    return _authenticated_login  # type: ignore[return-value]
+
+
 def fetch_repositories(username: str, *, limit: int = 100) -> list[dict[str, Any]]:
-    data = _get(f"/users/{username}/repos", per_page=min(limit, 100), sort="updated")
+    """List a user's repositories.
+
+    `/users/{username}/repos` returns **public repositories only**, even when
+    authenticated — which is why a token owner could not see their own private
+    work. `/user/repos` is the endpoint that includes private repositories, and
+    it only exists for the authenticated account, so it is used exactly when the
+    requested user *is* the token owner.
+    """
+    owner = authenticated_login()
+    if owner and owner.lower() == username.lower():
+        data = _get(
+            "/user/repos",
+            per_page=min(limit, 100),
+            sort="updated",
+            affiliation="owner,collaborator,organization_member",
+        )
+    else:
+        data = _get(f"/users/{username}/repos", per_page=min(limit, 100), sort="updated")
     repos = []
     for item in data if isinstance(data, list) else []:
         repos.append(

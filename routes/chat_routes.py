@@ -59,9 +59,10 @@ def chat():
         raise ValidationError("mode must be 'ask' or 'code'.")
 
     user_id = quota_service.current_user_id()
+    quota_service.require_thread_access(user_id, thread_id)
     quota_service.enforce(user_id)
 
-    workspace = app_state.workspaces.require(thread_id)
+    workspace = app_state.workspaces.require(thread_id, user_id=user_id)
 
     # A coding run must be on a task branch. Checked here, before any model
     # spend, and again inside the edit path.

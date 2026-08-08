@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from config import GITHUB_TOKEN, LIMITS, SETTINGS
-from core.errors import NotFoundError, SafetyError, ValidationError, WorkspaceError
+from core.errors import (
+    ForbiddenError,
+    NotFoundError,
+    SafetyError,
+    ValidationError,
+    WorkspaceError,
+)
 from core.safety import (
     BLOCKED_DIRECTORIES,
     is_binary_file,
@@ -98,6 +104,8 @@ class Workspace:
     loaded_at: float = field(default_factory=time.time)
     # Set by Phase 6 once a coding task starts editing.
     task_branch: str | None = None
+    # Who loaded this repository. Empty means unclaimed (single-user mode).
+    owner_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -132,14 +140,22 @@ class WorkspaceService:
         with self._lock:
             return self._workspaces.get(validate_thread_id(thread_id))
 
-    def require(self, thread_id: str) -> Workspace:
+    def require(self, thread_id: str, *, user_id: str | None = None) -> Workspace:
+        """Fetch a thread's workspace, refusing another user's.
+
+        A thread ID is client-supplied, so possessing one cannot be the only
+        thing standing between a user and someone else's cloned repository —
+        including its private source.
+        """
         workspace = self.get(thread_id)
         if workspace is None:
             raise NotFoundError("No repository is loaded for this session.")
+        if workspace.owner_id and user_id and workspace.owner_id != user_id:
+            raise ForbiddenError("This workspace belongs to another user.")
         return workspace
 
     # -- lifecycle -------------------------------------------------------
-    def load(self, thread_id: str, repo_url: str) -> Workspace:
+    def load(self, thread_id: str, repo_url: str, *, user_id: str = "") -> Workspace:
         """Clone a repository into this thread's workspace, replacing any existing one."""
         thread_id = validate_thread_id(thread_id)
         ref = github_service.parse_repo_url(repo_url)
@@ -183,6 +199,7 @@ class WorkspaceService:
             default_branch=metadata.get("default_branch") or git_service.default_branch(destination),
             branch=branch,
             head_sha=git_service.head_sha(destination),
+            owner_id=user_id,
         )
         with self._lock:
             self._workspaces[thread_id] = workspace

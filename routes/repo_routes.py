@@ -6,7 +6,7 @@ from flask import Blueprint, jsonify, request
 
 import app_state
 from core.errors import ValidationError
-from services import github_service
+from services import github_service, quota_service
 
 repo_bp = Blueprint("repo", __name__, url_prefix="/api/repo")
 
@@ -20,7 +20,14 @@ def _thread_id(payload: dict | None = None) -> str:
     thread_id = source.get("thread_id") or request.args.get("thread_id") or ""
     if not thread_id:
         raise ValidationError("thread_id is required.")
+    # A thread ID comes from the client, so it cannot be the only thing
+    # protecting a cloned repository — including a private one.
+    quota_service.require_thread_access(quota_service.current_user_id(), thread_id)
     return thread_id
+
+
+def _workspace(thread_id: str):
+    return app_state.workspaces.require(thread_id, user_id=quota_service.current_user_id())
 
 
 @repo_bp.post("/profile")
@@ -42,7 +49,9 @@ def load_repository():
     payload = _json()
     thread_id = _thread_id(payload)
     url = payload.get("url") or payload.get("repo_url") or ""
-    workspace = app_state.workspaces.load(thread_id, url)
+    workspace = app_state.workspaces.load(
+        thread_id, url, user_id=quota_service.current_user_id()
+    )
     return jsonify({"workspace": workspace.to_dict()})
 
 

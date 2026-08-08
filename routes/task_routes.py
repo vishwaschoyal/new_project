@@ -35,7 +35,7 @@ def start_task():
     """Create the task branch. Required before the agent may edit anything."""
     payload = _payload()
     thread_id = _thread_id(payload)
-    workspace = app_state.workspaces.require(thread_id)
+    workspace = app_state.workspaces.require(thread_id, user_id=quota_service.current_user_id())
     task = publisher.start_task(workspace, payload.get("description", ""))
     return jsonify({"task": task.to_dict()})
 
@@ -50,7 +50,7 @@ def task_status():
 def review_task():
     """The diff and check results the user approves or rejects."""
     thread_id = _thread_id()
-    workspace = app_state.workspaces.require(thread_id)
+    workspace = app_state.workspaces.require(thread_id, user_id=quota_service.current_user_id())
     return jsonify(publisher.review(workspace))
 
 
@@ -69,7 +69,7 @@ def approve_task():
     if not payload.get("confirmed"):
         raise ValidationError("Set 'confirmed': true to approve this action.")
 
-    workspace = app_state.workspaces.require(thread_id)
+    workspace = app_state.workspaces.require(thread_id, user_id=quota_service.current_user_id())
     outcome = publisher.approve(
         workspace,
         action=action,
@@ -84,7 +84,7 @@ def approve_task():
 @task_bp.post("/discard")
 def discard_task():
     thread_id = _thread_id()
-    workspace = app_state.workspaces.require(thread_id)
+    workspace = app_state.workspaces.require(thread_id, user_id=quota_service.current_user_id())
     return jsonify(publisher.discard(workspace))
 
 

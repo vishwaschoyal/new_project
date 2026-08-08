@@ -117,6 +117,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .repo-list li:hover { background: var(--border-soft); }
 .repo-lang, .repo-stars { color: var(--text-faint); font-size: 11px; margin-left: auto; }
+.repo-private {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--warn); border: 1px solid var(--warn); border-radius: 3px;
+  padding: 0 4px; line-height: 1.5;
+}
 
 .repo-title { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
 .repo-title a {
