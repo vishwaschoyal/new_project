@@ -70,16 +70,30 @@ def grep(
     # "." and "" both mean the repository root — a natural thing for the model
     # to send, and refusing it wastes a step for no safety benefit.
     search_root = workspace
+    target = "."
     scope = (path or "").strip().strip("/")
     if scope and scope not in {".", "./"}:
         try:
-            search_root = resolve_in_workspace(workspace, scope)
+            scoped = resolve_in_workspace(workspace, scope)
         except SafetyError as exc:
             return ToolResult.failure("grep", str(exc))
+        if scoped.is_dir():
+            search_root = scoped
+        else:
+            # Narrowing a search to one file is a reasonable thing to ask for,
+            # and ripgrep takes a file argument happily. Handing that path to
+            # subprocess as the working directory instead raises
+            # NotADirectoryError, which reaches the model as an exception name
+            # it cannot act on — it burns a step and guesses again.
+            search_root = scoped.parent
+            target = scoped.name
 
     limit = max(1, min(max_results, LIMITS.max_grep_matches))
     args = [
         "rg", "--line-number", "--no-heading", "--color", "never",
+        # ripgrep drops the filename prefix when handed exactly one file, which
+        # would leave the parser below reading the line number as the path.
+        "--with-filename",
         "--max-count", "10",          # per file, so one file cannot fill the budget
         "--max-columns", "300",
         "--max-filesize", "1M",
@@ -89,7 +103,7 @@ def grep(
         args.append("--ignore-case")
     if glob:
         args += ["--glob", glob]
-    args += ["--regexp", pattern, "."]
+    args += ["--regexp", pattern, target]
 
     try:
         proc = _run(args, cwd=search_root, timeout=LIMITS.tool_timeout_seconds)
@@ -97,6 +111,11 @@ def grep(
         return ToolResult.failure("grep", f"Search timed out after {LIMITS.tool_timeout_seconds}s.")
     except FileNotFoundError:
         return ToolResult.failure("grep", "ripgrep (rg) is not installed or not on PATH.")
+    except OSError as exc:
+        # A vanished directory, a permission refusal, a path the OS will not
+        # accept as a working directory. The loop can act on a sentence; it
+        # cannot act on a traceback class name.
+        return ToolResult.failure("grep", f"Search could not run: {exc}")
 
     # rg exits 1 for "no matches", which is a valid answer, not a failure.
     if proc.returncode not in (0, 1):
@@ -331,6 +350,8 @@ def bash(workspace: Path, *, command: str) -> ToolResult:
         )
     except FileNotFoundError:
         return ToolResult.failure("bash", f"{args[0]!r} is not installed on this host.")
+    except OSError as exc:
+        return ToolResult.failure("bash", f"Command could not run: {exc}")
 
     stdout, out_truncated = clamp_text(proc.stdout or "", LIMITS.max_tool_output_chars)
     stderr, err_truncated = clamp_text(proc.stderr or "", 2_000)

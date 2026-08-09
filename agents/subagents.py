@@ -150,7 +150,10 @@ def run_delegation(parent: "Orchestrator", arguments: dict[str, Any]) -> ToolRes
             max_steps=LIMITS.subagent_max_steps,
             token_budget=per_worker,
             system_prompt=prompts.SUBAGENT_SYSTEM_PROMPT,
-            ledger=EvidenceLedger(),          # a fresh, isolated ledger
+            # Fresh and isolated, but pointed at the same checkout: a worker's
+            # citations must face the same disk check as the parent's, or
+            # delegating would be a way to launder an unverified claim.
+            ledger=EvidenceLedger(workspace=parent.workspace),
             name=worker_name,
             allow_delegation=False,           # workers cannot fan out again
         )

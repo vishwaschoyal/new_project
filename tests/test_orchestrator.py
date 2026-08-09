@@ -158,6 +158,39 @@ class TestLoopDiscipline:
         assert result.tool_calls[1]["ok"] is False
         assert "already ran" in result.tool_calls[1]["summary"]
 
+    def test_refuses_a_read_of_lines_already_held(self, repo: Path, monkeypatch):
+        """Regression: overlapping reads walked one file eight times.
+
+        The arguments differ every call, so the repeated-call guard never sees
+        them. What they have in common is that almost every line requested is
+        already in context.
+        """
+        orchestrator, _, _ = build(repo, monkeypatch, [
+            turn(calls=[tool_call("read", path="handlers.py", offset=1, limit=250)]),
+            turn(calls=[tool_call("read", path="handlers.py", offset=3, limit=250)]),
+            turn(text="Done."),
+        ])
+        result = orchestrator.run()
+
+        assert result.tool_calls[0]["ok"] is True
+        assert result.tool_calls[1]["ok"] is False
+        assert "already read" in result.tool_calls[1]["summary"]
+
+    def test_allows_a_read_that_extends_past_what_is_held(self, repo: Path, monkeypatch):
+        """The guard must not block genuinely new ground, or tracing a long
+        file becomes impossible."""
+        long_file = repo / "long.py"
+        long_file.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 601)), encoding="utf-8")
+
+        orchestrator, _, _ = build(repo, monkeypatch, [
+            turn(calls=[tool_call("read", path="long.py", offset=1, limit=200)]),
+            turn(calls=[tool_call("read", path="long.py", offset=201, limit=200)]),
+            turn(text="Done."),
+        ])
+        result = orchestrator.run()
+
+        assert [call["ok"] for call in result.tool_calls] == [True, True]
+
     def test_stops_at_the_step_limit(self, repo: Path, monkeypatch):
         script = [turn(calls=[tool_call("glob", pattern=f"*{i}.py")]) for i in range(20)]
         script.append(turn(text="Finalised."))

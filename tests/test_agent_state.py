@@ -89,6 +89,130 @@ class TestEvidenceLedger:
         assert "Entry point" in rendered and "app.py:6-8" in rendered
 
 
+class TestObservationCoverage:
+    """Overlap arithmetic behind the redundant-read refusal.
+
+    Regression: a loop tracing one file read it eight times in overlapping
+    windows (184-433, then 232-481, then 280-529...). Every call was a new
+    argument set, so the repeated-call guard never fired, and the run paid for
+    the same lines repeatedly while inflating the context into needless
+    compaction.
+    """
+
+    def test_full_overlap_is_total_coverage(self):
+        ledger = EvidenceLedger()
+        ledger.record_observation("a.py", 1, 100)
+        assert ledger.coverage_of("a.py", 20, 40) == 1.0
+
+    def test_partial_overlap_is_measured(self):
+        ledger = EvidenceLedger()
+        ledger.record_observation("a.py", 184, 433)
+        # The real second read from the transcript: mostly lines already held.
+        assert ledger.coverage_of("a.py", 232, 481) > 0.8
+
+    def test_a_genuine_extension_is_not_covered(self):
+        ledger = EvidenceLedger()
+        ledger.record_observation("a.py", 184, 433)
+        assert ledger.coverage_of("a.py", 434, 683) == 0.0
+
+    def test_unread_file_is_uncovered(self):
+        assert EvidenceLedger().coverage_of("never.py", 1, 50) == 0.0
+
+    def test_resume_point_skips_what_is_held(self):
+        ledger = EvidenceLedger()
+        ledger.record_observation("a.py", 184, 433)
+        assert ledger.first_unobserved_line("a.py", 232, 481) == 434
+
+    def test_no_resume_point_when_fully_read(self):
+        ledger = EvidenceLedger()
+        ledger.record_observation("a.py", 1, 100)
+        assert ledger.first_unobserved_line("a.py", 10, 90) is None
+
+
+class TestCitationContentVerification:
+    """A citation must describe the lines it points at, not merely have visited
+    them.
+
+    Regression: an answer cited `static/app.js:537-596` for `send()` and
+    `handleEvent()`. Those lines had genuinely been read, so range checking
+    passed them — but they hold unrelated trail-rendering code, and the real
+    functions live hundreds of lines away.
+    """
+
+    @pytest.fixture
+    def ledger(self, repo):
+        return EvidenceLedger(workspace=repo)
+
+    def test_claim_matching_the_cited_lines_is_supported(self, ledger):
+        ledger.record_observation("handlers.py", 1, 12)
+        report = ledger.verify_answer("validate(request) raises on a missing path. handlers.py:6-8")
+        assert len(report["supported"]) == 1
+        assert report["contradicted"] == []
+
+    def test_claim_naming_a_symbol_that_is_elsewhere_is_contradicted(self, tmp_path):
+        """The exact shape of the real failure: lines read, claim unrelated.
+
+        The reported answer cited app.js:537-596 for `send()`, which is really
+        defined at 889. Both regions had been read, so only the content check
+        can tell them apart.
+        """
+        source = ["function trailAdd(item) {}"] * 888 + ["async function send(question) {}"]
+        (tmp_path / "app.js").write_text("\n".join(source), encoding="utf-8")
+
+        ledger = EvidenceLedger(workspace=tmp_path)
+        ledger.record_observation("app.js", 520, 640)
+        report = ledger.verify_answer("send(question) submits the message. app.js:537-596")
+
+        assert len(report["contradicted"]) == 1
+        assert report["all_supported"] is False
+
+    def test_unobserved_lines_stay_unsupported_not_contradicted(self, ledger):
+        report = ledger.verify_answer("Something happens. never_read.py:5")
+        assert len(report["unsupported"]) == 1
+        assert report["contradicted"] == []
+
+    def test_a_claim_with_no_identifiers_is_left_alone(self, ledger):
+        """Prose cannot be checked against source, so it is never rejected."""
+        ledger.record_observation("handlers.py", 1, 14)
+        report = ledger.verify_answer("This is where the work happens. handlers.py:1-3")
+        assert len(report["supported"]) == 1
+
+    def test_citing_a_body_rather_than_the_def_line_still_passes(self, ledger):
+        """Slack absorbs the normal habit of citing a function's body."""
+        ledger.record_observation("app.py", 1, 16)
+        report = ledger.verify_answer("create_app() builds the application. app.py:7-8")
+        assert len(report["supported"]) == 1
+
+    def test_a_symbol_named_only_inside_a_comment_does_not_count(self, tmp_path):
+        """Whole-identifier matching: 'sends' in prose is not the `send` symbol."""
+        (tmp_path / "ui.js").write_text(
+            "// the loop never sends its reasoning\nfunction render() {}\n", encoding="utf-8"
+        )
+        ledger = EvidenceLedger(workspace=tmp_path)
+        ledger.record_observation("ui.js", 1, 2)
+        report = ledger.verify_answer("send() posts the message. ui.js:1-2")
+        assert len(report["contradicted"]) == 1
+
+    def test_a_trailing_citation_keeps_the_line_above_it(self, ledger):
+        """A citation alone on its line is judged with the claim that earned it."""
+        ledger.record_observation("handlers.py", 1, 14)
+        report = ledger.verify_answer("validate(request) checks the path.\nhandlers.py:6-8")
+        assert len(report["supported"]) == 1
+
+    def test_without_a_workspace_only_ranges_are_checked(self):
+        """No disk access configured means no opinion — never a rejection."""
+        ledger = EvidenceLedger()
+        ledger.record_observation("handlers.py", 1, 3)
+        report = ledger.verify_answer("respond() lives here. handlers.py:1-3")
+        assert len(report["supported"]) == 1
+
+    def test_a_citation_to_a_secret_file_is_not_opened(self, ledger):
+        """Citations come from model output and go through the same path rules."""
+        ledger.record_observation(".env", 1, 1)
+        report = ledger.verify_answer("The key is set here. .env:1")
+        assert report["contradicted"] == []
+
+
 class TestDecomposition:
     def test_single_question_stays_single(self):
         assert len(decompose_question("Where is the entry point?")) == 1

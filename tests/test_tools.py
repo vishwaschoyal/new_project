@@ -58,6 +58,22 @@ class TestGrep:
         result = read_tools.grep(repo, pattern="def", path="../..")
         assert not result.ok
 
+    def test_scoping_to_a_single_file_works(self, repo: Path):
+        """Regression: a file as the scope became the subprocess working
+        directory, and the model got `NotADirectoryError: [WinError 267]` — a
+        message it cannot act on, so it burned a step and guessed again."""
+        result = read_tools.grep(repo, pattern="def", path="handlers.py")
+        assert result.ok
+        assert "handlers.py:1:" in result.content
+        assert "app.py" not in result.content
+
+    def test_a_single_file_scope_is_still_path_stamped(self, repo: Path):
+        """ripgrep omits the filename when given one file; without forcing it
+        back on, the line number is parsed as the path."""
+        result = read_tools.grep(repo, pattern="def validate", path="handlers.py")
+        assert result.ok
+        assert result.content.startswith("handlers.py:6:")
+
     @pytest.mark.parametrize("scope", [".", "./", "", "  ", "/"])
     def test_treats_dot_as_the_repository_root(self, repo: Path, scope: str):
         """Models naturally send path='.' for 'search everywhere'. Refusing it

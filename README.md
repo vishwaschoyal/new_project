@@ -118,7 +118,7 @@ tools/                  grep, glob, read, bash, edit, run_check + registry
 services/               workspaces, git, github, sandbox, publish, cost, quotas, storage
 routes/                 repo, chat (SSE), history, task, health
 core/                   safety, errors, structured logging
-tests/                  ~390 tests, fully offline
+tests/                  ~535 tests, fully offline
 scripts/run_benchmarks.py   live benchmark harness
 ```
 

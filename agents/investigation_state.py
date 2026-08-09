@@ -5,9 +5,12 @@ will cheerfully answer the first half and stop. This module makes that
 structurally difficult: the question is decomposed into explicit obligations,
 and finalisation is challenged while any remain open.
 
-It also enforces the loop's anti-thrash rules — repeated identical calls,
-re-reading a range already in context, and citing lines never observed. Each of
-those wastes budget and, worse, produces confident answers built on nothing.
+It also owns one of the loop's anti-thrash rules: a tool call repeated argument
+for argument. The other two live where the knowledge they need lives — reads
+that overlap what is already in context are caught by the orchestrator against
+the evidence ledger, and citations to unobserved lines by the ledger itself.
+Each of those wastes budget and, worse, produces confident answers built on
+nothing.
 """
 
 from __future__ import annotations
