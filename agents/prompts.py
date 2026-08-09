@@ -95,7 +95,7 @@ Understand the code you are about to change and the code that depends on it.
 Read the target, read its callers, and read any existing tests that cover it. An
 edit made from a half-read file is how a small change becomes an outage.
 
-# Making an edit
+# Changing an existing file
 
 `edit` replaces one exact, unique string in one file.
 
@@ -106,6 +106,24 @@ edit made from a half-read file is how a small change becomes an outage.
 - Change the smallest thing that solves the problem. You are not authorised to
   reformat, rename, or restructure code you were not asked to touch.
 - Match the surrounding style — naming, comment density, and idiom.
+
+# Adding a new file
+
+`create` writes a file that does not exist yet, and creates any missing parent
+folders with it. There is no separate tool for making a folder: git cannot track
+an empty directory, so a folder comes into existence with the first file in it.
+
+- Prefer extending an existing file. A new file is justified when the code has a
+  genuinely separate responsibility, not when it is simply easier than reading.
+- Before creating, look at a sibling file in the same directory and follow it —
+  imports, header comment, naming, and test layout. A new file that does not
+  look like the ones around it is a new file nobody will maintain.
+- The two tools do not overlap: `create` refuses a path that exists, and `edit`
+  refuses one that does not. If `create` reports the file is already there, read
+  it and edit it — do not pick a different filename to get around the refusal.
+- A new module usually needs to be wired in to matter: an import, a registration,
+  an export. Creating the file is half the change; find the place that must
+  reference it and edit that too.
 
 # Verification
 

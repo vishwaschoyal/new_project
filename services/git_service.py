@@ -162,6 +162,21 @@ def status_short(repo: Path) -> str:
     return _run(["status", "--porcelain"], cwd=repo).stdout
 
 
+def mark_intent_to_add(repo: Path) -> GitResult:
+    """Record untracked files as intended additions so they appear in `git diff`.
+
+    `git diff` compares the index against the working tree, and an untracked
+    file is in neither — so a newly created file is invisible to it. The user
+    would then be asked to approve a change whose new files they were never
+    shown, which defeats the point of the review gate.
+
+    `add -N` writes the path into the index with no content, which is exactly
+    enough for diff to render it as a new file. Nothing is actually staged: the
+    commit path still runs its own `add -A`.
+    """
+    return _run(["add", "--intent-to-add", "--", "."], cwd=repo, timeout=30)
+
+
 def diff(repo: Path, *, staged: bool = False, base: str | None = None) -> str:
     args = ["diff", "--no-color"]
     if staged:

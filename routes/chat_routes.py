@@ -188,8 +188,12 @@ def _persist(thread_id: str, user_id: str, question: str, result, *, mode: str) 
 def _record_task_progress(thread_id: str, result) -> None:
     """Fold the run's edits and checks into the task audit trail."""
     for call in result.tool_calls:
-        if call["name"] == "edit" and call["ok"]:
-            publisher.record_edit(thread_id, str(call["arguments"].get("path", "")))
+        if call["name"] in {"edit", "create"} and call["ok"]:
+            publisher.record_edit(
+                thread_id,
+                str(call["arguments"].get("path", "")),
+                created=call["name"] == "create",
+            )
         elif call["name"] == "run_check":
             publisher.record_check(
                 thread_id,

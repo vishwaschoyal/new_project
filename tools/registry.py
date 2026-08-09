@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
-from tools import edit_tools, read_tools, verify_tools
+from tools import create_tools, edit_tools, read_tools, verify_tools
 from tools.base import ToolResult, Timer
 
 
@@ -153,6 +153,31 @@ EDIT = ToolSpec(
     handler=edit_tools.edit,
 )
 
+CREATE = ToolSpec(
+    name="create",
+    description=(
+        "Write a NEW file that does not exist yet. Missing parent folders are created "
+        "along with it, so 'pkg/parsers/json.py' makes the folders too — there is no "
+        "separate folder tool because git cannot track an empty directory. Refuses if "
+        "the path already exists: to change an existing file, read it and use edit."
+    ),
+    parameters=_obj(
+        {
+            "path": {
+                "type": "string",
+                "description": "Repository-relative path for the new file, e.g. 'utils/text.py'.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete contents of the file, matching the project's style.",
+            },
+        },
+        ["path", "content"],
+    ),
+    capability=Capability.EDIT,
+    handler=create_tools.create,
+)
+
 
 RUN_CHECK = ToolSpec(
     name="run_check",
@@ -181,7 +206,7 @@ RUN_CHECK = ToolSpec(
 )
 
 
-_ALL_SPECS: tuple[ToolSpec, ...] = (GREP, GLOB, READ, BASH, EDIT, RUN_CHECK)
+_ALL_SPECS: tuple[ToolSpec, ...] = (GREP, GLOB, READ, BASH, EDIT, CREATE, RUN_CHECK)
 
 
 class ToolRegistry:

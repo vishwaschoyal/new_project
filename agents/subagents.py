@@ -117,7 +117,13 @@ def run_delegation(parent: "Orchestrator", arguments: dict[str, Any]) -> ToolRes
     parent.emit(
         AgentEvent(
             "subagents_start",
-            {"count": len(cleaned), "names": [t["name"] for t in cleaned], "budget_each": per_worker},
+            {
+                "count": len(cleaned),
+                "names": [t["name"] for t in cleaned],
+                "objectives": {t["name"]: t["objective"] for t in cleaned},
+                "budget_each": per_worker,
+                "steps_each": LIMITS.subagent_max_steps,
+            },
         )
     )
 
@@ -127,7 +133,11 @@ def run_delegation(parent: "Orchestrator", arguments: dict[str, Any]) -> ToolRes
         def worker_emit(event: "AgentEvent") -> None:
             # Workers stream progress, never answer text: two workers writing
             # prose into one stream would interleave into nonsense.
-            if event.type in {"tool_start", "tool_end", "finding"}:
+            #
+            # `step` is forwarded because a watcher needs to see a worker that
+            # is thinking, not only one that has just finished a tool call —
+            # without it a slow worker is indistinguishable from a stalled one.
+            if event.type in {"step", "tool_start", "tool_end", "finding"}:
                 parent.emit(AgentEvent(f"subagent_{event.type}", {**event.data, "worker": worker_name}))
 
         worker = Orchestrator(
@@ -144,7 +154,28 @@ def run_delegation(parent: "Orchestrator", arguments: dict[str, Any]) -> ToolRes
             name=worker_name,
             allow_delegation=False,           # workers cannot fan out again
         )
-        return worker_name, worker.run(), worker
+        result = worker.run()
+
+        # A compact completion event, built here rather than by forwarding the
+        # worker's own `done`: that one carries the full answer, evidence, and
+        # tool trail, and pushing four of those through the stream would cost
+        # more bandwidth than the entire rest of the run.
+        parent.emit(
+            AgentEvent(
+                "subagent_done",
+                {
+                    "worker": worker_name,
+                    "steps_used": result.steps_used,
+                    "steps_total": LIMITS.subagent_max_steps,
+                    "findings": len(result.evidence),
+                    "files": len(worker.ledger.observed_files),
+                    "termination_reason": result.termination_reason,
+                    "cost_usd": worker.usage.cost_usd,
+                    "wall_seconds": result.wall_seconds,
+                },
+            )
+        )
+        return worker_name, result, worker
 
     results: list[tuple[str, Any, "Orchestrator"]] = []
     with ThreadPoolExecutor(max_workers=len(cleaned)) as pool:
@@ -193,9 +224,17 @@ def run_delegation(parent: "Orchestrator", arguments: dict[str, Any]) -> ToolRes
     if not sections:
         return ToolResult.failure("delegate", "Every worker failed. Investigate directly instead.")
 
+    covered = sorted({path for worker in (w for _, _, w in results)
+                      for path in worker.ledger.observed_files})
     report = (
-        f"{len(results)} worker(s) finished. Their findings are now in your evidence "
-        f"and you may cite them directly.\n\n" + "\n\n".join(sections)
+        f"{len(results)} worker(s) finished. Their findings are in your evidence and you "
+        f"may cite them directly, exactly as if you had read those lines yourself.\n\n"
+        f"This work is DONE. Do not re-read the files below to confirm it — the answer "
+        f"you are being paid to produce is the synthesis of these reports, not a second "
+        f"investigation of the same ground. Read further only where a worker explicitly "
+        f"reported a gap, or where the question needs something no worker covered.\n\n"
+        f"Already covered: {', '.join(covered) if covered else '(no files reported)'}\n\n"
+        + "\n\n".join(sections)
     )
     return ToolResult.success(
         "delegate", report, workers=len(results), evidence_merged=merged_total

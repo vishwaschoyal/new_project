@@ -97,6 +97,15 @@ class EvidenceLedger:
                 if len(parts) >= 2 and parts[1].isdigit():
                     self.record_observation(parts[0], int(parts[1]), int(parts[1]))
 
+        elif tool == "create":
+            # A file the agent just wrote is observed in the strongest sense
+            # available: it authored every line. Without this, describing the
+            # change it made would fail citation checking as if it had guessed.
+            path = result_metadata.get("path")
+            lines = result_metadata.get("lines")
+            if path and lines:
+                self.record_observation(str(path), 1, int(lines))
+
     def was_observed(self, path: str, start_line: int, end_line: int | None = None) -> bool:
         end_line = end_line or start_line
         with self._lock:

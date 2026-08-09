@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tools import edit_tools, read_tools
+from tools import create_tools, edit_tools, read_tools
 from tools.registry import (
     Capability,
     EDITING_CAPABILITIES,
@@ -235,6 +235,111 @@ class TestEdit:
         assert "-# Sample" in result.content
 
 
+class TestCreate:
+    """`create` writes new files; `edit` changes existing ones.
+
+    The pair has to stay disjoint. If `create` could overwrite, a whole file
+    could be replaced by a call that quoted none of its current contents — the
+    exact failure `edit`'s exact-match rule exists to make impossible.
+    """
+
+    def test_writes_a_new_file(self, repo: Path):
+        result = create_tools.create(
+            repo, path="utils/text.py", content="def shout(value):\n    return value.upper()\n"
+        )
+        assert result.ok
+        assert (repo / "utils" / "text.py").read_text(encoding="utf-8").startswith("def shout")
+        assert result.metadata["path"] == "utils/text.py"
+        assert result.metadata["lines"] == 2
+
+    def test_creates_missing_parent_folders(self, repo: Path):
+        """The answer to 'make me a folder': a folder arrives with its file,
+        because git cannot track an empty directory."""
+        result = create_tools.create(
+            repo, path="pkg/parsers/json_parser.py", content="VALUE = 1\n"
+        )
+        assert result.ok
+        assert (repo / "pkg" / "parsers").is_dir()
+        assert result.metadata["created_directories"] == ["pkg", "pkg/parsers"]
+
+    def test_reports_only_folders_it_actually_made(self, repo: Path):
+        result = create_tools.create(repo, path="src/utils/new.py", content="X = 1\n")
+        assert result.ok
+        # src/ and src/utils/ already exist in the fixture repository.
+        assert result.metadata["created_directories"] == []
+
+    def test_refuses_an_existing_file(self, repo: Path):
+        before = (repo / "app.py").read_text(encoding="utf-8")
+        result = create_tools.create(repo, path="app.py", content="wiped\n")
+        assert not result.ok
+        assert "already exists" in result.content
+        assert "edit" in result.content
+        assert (repo / "app.py").read_text(encoding="utf-8") == before
+
+    def test_refuses_an_existing_directory(self, repo: Path):
+        result = create_tools.create(repo, path="src", content="not a file\n")
+        assert not result.ok
+        assert "already exists" in result.content
+
+    def test_points_a_directory_request_at_a_file(self, repo: Path):
+        result = create_tools.create(repo, path="docs/", content="x\n")
+        assert not result.ok
+        assert "README.md" in result.content
+        assert not (repo / "docs").exists()
+
+    @pytest.mark.parametrize("path", ["../escape.py", "/etc/passwd", "C:/temp/x.py"])
+    def test_refuses_paths_outside_the_workspace(self, repo: Path, path: str):
+        assert not create_tools.create(repo, path=path, content="x\n").ok
+
+    @pytest.mark.parametrize("path", ["keys/private.pem", "src/credentials", "id_rsa"])
+    def test_refuses_secret_paths(self, repo: Path, path: str):
+        result = create_tools.create(repo, path=path, content="x\n")
+        assert not result.ok
+        assert not (repo / path).exists()
+
+    def test_never_overwrites_an_existing_secret_file(self, repo: Path):
+        before = (repo / ".env").read_bytes()
+        assert not create_tools.create(repo, path=".env", content="OPENAI_API_KEY=x\n").ok
+        assert (repo / ".env").read_bytes() == before
+
+    def test_refuses_blocked_directories(self, repo: Path):
+        assert not create_tools.create(repo, path=".git/hooks/pre-commit", content="x\n").ok
+
+    def test_refuses_empty_content(self, repo: Path):
+        assert not create_tools.create(repo, path="blank.py", content="   \n").ok
+
+    def test_refuses_oversized_content(self, repo: Path):
+        oversized = "x" * (create_tools.MAX_NEW_FILE_CHARS + 1)
+        result = create_tools.create(repo, path="big.py", content=oversized)
+        assert not result.ok
+        assert not (repo / "big.py").exists()
+
+    def test_refuses_binary_content(self, repo: Path):
+        assert not create_tools.create(repo, path="bin.dat", content="a\x00b").ok
+
+    def test_normalises_line_endings_and_final_newline(self, repo: Path):
+        """A new file has no existing convention to preserve, so it gets the
+        one every other tool in the chain assumes."""
+        create_tools.create(repo, path="crlf.py", content="a = 1\r\nb = 2")
+        written = (repo / "crlf.py").read_bytes()
+        assert b"\r" not in written
+        assert written.endswith(b"\n")
+
+    def test_previews_the_content_it_wrote(self, repo: Path):
+        result = create_tools.create(repo, path="p.py", content="alpha = 1\nbeta = 2\n")
+        assert "alpha = 1" in result.content
+        assert "beta = 2" in result.content
+
+    def test_redacts_secrets_from_the_preview(self, repo: Path):
+        """The preview echoes the content back to the model and the trail, so
+        it goes through the same redaction as any other tool output."""
+        result = create_tools.create(
+            repo, path="cfg.py", content='TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123"\n'
+        )
+        assert result.ok
+        assert "ghp_abcdefghijklmnopqrstuvwxyz0123" not in result.content
+
+
 class TestRegistry:
     def test_read_only_registry_excludes_edit(self, repo: Path):
         registry = ToolRegistry(repo, capabilities=READ_ONLY_CAPABILITIES)
@@ -248,9 +353,18 @@ class TestRegistry:
         assert not result.ok
         assert result.metadata["refused"] is True
 
+    def test_create_is_refused_without_the_capability(self, repo: Path):
+        """A read-only run must not be able to write a file into the workspace."""
+        registry = ToolRegistry(repo, capabilities=READ_ONLY_CAPABILITIES)
+        result = registry.dispatch("create", {"path": "planted.py", "content": "x = 1\n"})
+        assert not result.ok
+        assert result.metadata["refused"] is True
+        assert not (repo / "planted.py").exists()
+
     def test_editing_registry_includes_edit_and_run_check(self, repo: Path):
         registry = ToolRegistry(repo, capabilities=EDITING_CAPABILITIES)
         assert "edit" in registry.names
+        assert "create" in registry.names
         assert "run_check" in registry.names
 
     def test_rejects_unknown_tools(self, repo: Path):

@@ -155,12 +155,19 @@ class PublishService:
         return task
 
     # -- progress recording ----------------------------------------------
-    def record_edit(self, thread_id: str, path: str, line: int | None = None) -> None:
+    def record_edit(
+        self, thread_id: str, path: str, line: int | None = None, *, created: bool = False
+    ) -> None:
         task = self.get(thread_id)
         if task is None:
             return
         task.edited_files.add(path)
-        task.log("edit", f"Edited {path}" + (f" at line {line}" if line else ""), path=path)
+        task.log(
+            "edit",
+            f"{'Created' if created else 'Edited'} {path}"
+            + (f" at line {line}" if line else ""),
+            path=path,
+        )
 
     def record_check(self, thread_id: str, check: dict[str, Any]) -> None:
         task = self.get(thread_id)
@@ -179,6 +186,11 @@ class PublishService:
     def review(self, workspace: Workspace) -> dict[str, Any]:
         """The diff the user approves or rejects."""
         task = self.require(workspace.thread_id)
+
+        # Files `create` wrote are untracked, and untracked files are absent
+        # from `git diff`. Register them first so the reviewer sees every file
+        # the run produced, not only the ones it modified.
+        git_service.mark_intent_to_add(workspace.path)
 
         working_diff = git_service.diff(workspace.path)
         committed_diff = git_service.diff(workspace.path, base=task.base_branch) if task.committed else ""
