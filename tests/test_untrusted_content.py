@@ -265,6 +265,7 @@ class TestHiddenElements:
     VISIBLE_ON_LOAD = {
         "empty-state": "the welcome screen, shown until the first message",
         "repo-picker": "the load-a-repository form, shown until a repo is loaded",
+        "fanout-pop": "the pop-out affordance, inside #fanout which starts hidden",
     }
 
     def test_elements_toggled_from_js_are_hidden_in_markup(self, app_js: str):
@@ -290,3 +291,306 @@ class TestHiddenElements:
 
         # Guard the guard: a broken regex would make this vacuously pass.
         assert checked >= 3, f"expected to check several toggled elements, checked {checked}"
+
+
+class TestScrollContainment:
+    """The panes scroll; the page does not.
+
+    Regression: `.layout` is a 100vh grid, but a grid item's default
+    `min-height: auto` lets it grow to fit its content instead of scrolling
+    inside its track. The message list pushed `.main` past the viewport, the
+    whole document scrolled, and the sidebar rode down with the chat.
+    """
+
+    @pytest.fixture
+    def css(self) -> str:
+        return (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+    def _rule(self, css: str, selector: str) -> str:
+        """The top-level rule for ``selector``. Anchored to the line start so an
+        indented copy inside a media query cannot answer for the base rule."""
+        match = re.search(
+            rf"^{re.escape(selector)}\s*\{{([^}}]*)\}}", css, re.MULTILINE
+        )
+        assert match, f"{selector} rule not found in style.css"
+        return match.group(1)
+
+    @pytest.mark.parametrize("selector", [".sidebar", ".main", ".messages"])
+    def test_scrolling_columns_can_shrink(self, css: str, selector: str):
+        """Without `min-height: 0` the overflow rule below it does nothing."""
+        assert re.search(r"min-height:\s*0", self._rule(css, selector)), (
+            f"{selector} needs min-height: 0 or it grows past its track "
+            f"instead of scrolling inside it"
+        )
+
+    def test_the_page_itself_does_not_scroll(self, css: str):
+        assert re.search(r"overflow:\s*hidden", self._rule(css, "html, body"))
+        assert re.search(r"overflow:\s*hidden", self._rule(css, ".layout"))
+
+    def test_both_panes_still_scroll_their_own_content(self, css: str):
+        for selector in (".sidebar", ".messages"):
+            assert re.search(r"overflow-y:\s*auto", self._rule(css, selector)), (
+                f"{selector} must scroll its own content"
+            )
+
+
+class TestThemeTokens:
+    """Colours live in variables so light and dark cannot drift apart."""
+
+    @pytest.fixture
+    def css(self) -> str:
+        return (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+    def test_dark_mode_is_reachable_both_ways(self, css: str):
+        """An explicit `data-theme` must win, and the OS default must still
+        work when no choice has been made."""
+        assert "prefers-color-scheme: dark" in css
+        assert '[data-theme="dark"]' in css
+
+    def test_every_dark_token_has_a_light_definition(self, css: str):
+        """A token defined only inside the dark block is undefined in light."""
+        blocks = re.findall(r"\{([^{}]*)\}", css)
+        base = set(re.findall(r"(--[\w-]+):", blocks[0]))          # bare :root
+        dark = set(re.findall(r"(--[\w-]+):", css.split('[data-theme="dark"]')[1]))
+        assert dark <= base, f"defined only in dark: {sorted(dark - base)}"
+
+    def test_the_body_paints_its_own_background(self, css: str):
+        """A transparent body borrows whatever is behind it."""
+        match = re.search(r"html, body\s*\{([^}]*)\}", css)
+        assert match and "background: var(--bg)" in match.group(1)
+
+
+class TestComposerSizing:
+    """The mode toggle must not grow with the textarea.
+
+    Regression: `.mode-toggle` had `align-self: stretch` inside the composer's
+    flex row. As the auto-growing textarea climbed toward its 180px cap on a
+    longer prompt, the toggle stretched to match it, so Ask/Code visibly grew
+    and shrank as you typed instead of staying a fixed button size.
+    """
+
+    @pytest.fixture
+    def css(self) -> str:
+        return (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+    def test_mode_toggle_does_not_stretch_to_the_textarea(self, css: str):
+        match = re.search(r"\.mode-toggle\s*\{([^}]*)\}", css)
+        assert match, ".mode-toggle rule not found in style.css"
+        assert "align-self" not in match.group(1), (
+            "mode-toggle must not override the composer's own alignment, or "
+            "its height tracks the auto-growing textarea again"
+        )
+
+    def test_textarea_growth_is_still_capped(self, css: str):
+        match = re.search(r"\.composer textarea\s*\{([^}]*)\}", css)
+        assert match and re.search(r"max-height:\s*180px", match.group(1))
+
+
+class TestStreamingRenderIsThrottled:
+    """One re-render per animation frame, not one per SSE delta.
+
+    Regression: `appendDelta` ran a full marked.parse + DOMPurify.sanitize +
+    innerHTML replace on every streamed chunk. Chunks can arrive faster than
+    the screen repaints, so the message body was rebuilt more often than it
+    was ever actually shown — the visible symptom was streaming that flickered
+    instead of feeling smooth.
+    """
+
+    @pytest.fixture
+    def app_js(self) -> str:
+        return (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    def test_append_delta_does_not_render_synchronously(self, app_js: str):
+        match = re.search(r"function appendDelta\([^)]*\)\s*\{([^}]*)\}", app_js)
+        assert match, "appendDelta not found in app.js"
+        body = match.group(1)
+        assert "innerHTML" not in body, (
+            "appendDelta must not render directly — every SSE delta would "
+            "force a full re-parse and repaint of the whole message body"
+        )
+        assert "requestAnimationFrame" in app_js
+
+    def test_a_render_still_queued_at_finish_is_cancelled(self, app_js: str):
+        """Otherwise a stale frame lands after finishMessage and wipes out
+        the highlighting and citation links it just added."""
+        match = re.search(r"function finishMessage\([^)]*\)\s*\{([^}]*)\}", app_js)
+        assert match and "cancelAnimationFrame" in match.group(1)
+
+
+class TestNarration:
+    """Commentary on the run is derived from events, never invented.
+
+    The loop deliberately does not stream its reasoning to the browser, so
+    there is no inner monologue available to display. Writing prose that reads
+    like one would be the same failure the evidence ledger exists to prevent:
+    text that sounds like a report of something real and is not. Every line the
+    UI says must be traceable to an event that actually fired.
+    """
+
+    @pytest.fixture
+    def app_js(self) -> str:
+        return (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    def _span(self, app_js: str, name: str) -> tuple[int, int]:
+        match = re.search(rf"function {name}\(.*?\n  \}}", app_js, re.DOTALL)
+        assert match, f"{name} not found in app.js"
+        return match.span()
+
+    def test_narration_is_only_reachable_from_the_event_handler(self, app_js: str):
+        """`narrate` may only be called while handling a stream event. A call
+        from anywhere else would be text with no event behind it."""
+        allowed = [
+            re.search(r"function handleEvent\(.*?\n  \}\n", app_js, re.DOTALL).span(),
+            self._span(app_js, "narrateTool"),
+            self._span(app_js, "narrate"),          # its own definition
+        ]
+
+        calls = [m.start() for m in re.finditer(r"\bnarrate\(", app_js)]
+        assert calls, "no narration is emitted at all"
+        for position in calls:
+            assert any(start <= position < end for start, end in allowed), (
+                "narrate() is called outside the event handler — narration must "
+                "describe an event, not fill silence"
+            )
+
+    def test_every_phrase_belongs_to_a_real_phase(self, app_js: str):
+        """A phrase for a phase no tool maps to is narration that can never
+        fire — and a phase with no phrase is a silent gap."""
+        phase_block = re.search(r"const PHASE_OF = \{(.*?)\};", app_js, re.DOTALL)
+        phrase_block = re.search(r"const PHRASES = \{(.*?)\n  \};", app_js, re.DOTALL)
+        assert phase_block and phrase_block
+
+        phases = set(re.findall(r":\s*\"(\w+)\"", phase_block.group(1)))
+        phrases = set(re.findall(r"^\s{4}(\w+):\s*\[", phrase_block.group(1), re.MULTILINE))
+        assert phases == phrases, (
+            f"phases without phrasing: {sorted(phases - phrases)}; "
+            f"phrasing that can never fire: {sorted(phrases - phases)}"
+        )
+
+    def test_narration_does_not_repeat_for_the_same_kind_of_work(self, app_js: str):
+        """A sentence in front of all forty reads is noise, not narration."""
+        match = re.search(r"function narrateTool\(.*?\n  \}", app_js, re.DOTALL)
+        assert match and "phase === ctx.phase" in match.group(0), (
+            "narrateTool must return early when the phase has not changed"
+        )
+
+    def test_the_run_context_survives_between_events(self, app_js: str):
+        """Regression: the context object was rebuilt inline on every SSE frame,
+        so the phase it had just recorded was discarded immediately and every
+        tool call narrated itself."""
+        assert not re.search(r"handleEvent\(type, data, \{", app_js), (
+            "handleEvent must receive one long-lived context, not a fresh "
+            "object per event"
+        )
+        assert re.search(r"const ctx = \{", app_js)
+
+    def test_narrated_arguments_are_escaped(self, app_js: str):
+        """Narration is inserted as HTML and quotes tool arguments — which
+        include model-chosen search patterns and repository paths."""
+        match = re.search(r"function narrateTool\(.*?\n  \}", app_js, re.DOTALL)
+        assert match and "escapeHtml" in match.group(0)
+
+
+class TestFanoutView:
+    """The live parallel-investigation panel.
+
+    The flat trail is ordered by time, which is the wrong axis for concurrent
+    work: four workers interleave into one list and none of them is legible.
+    This panel re-arranges the same events by worker. Its numbers must come
+    from the stream — a progress bar that advances on a timer is a decoration
+    that lies about what the run is doing.
+    """
+
+    @pytest.fixture
+    def app_js(self) -> str:
+        return (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    @pytest.fixture
+    def css(self) -> str:
+        return (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+    @pytest.fixture
+    def html(self) -> str:
+        return (ROOT / "templates" / "index.html").read_text(encoding="utf-8")
+
+    def test_every_element_it_drives_exists_in_the_template(self, app_js: str, html: str):
+        ids = set(re.findall(r'\$\("(fanout[\w-]*)"\)', app_js))
+        assert ids, "the fanout panel binds no elements"
+        for element_id in sorted(ids):
+            assert f'id="{element_id}"' in html, f"#{element_id} is missing from index.html"
+
+    def test_it_starts_hidden(self, html: str):
+        tag = re.search(r'<section id="fanout"[^>]*>', html)
+        assert tag and "hidden" in tag.group(0)
+
+    def test_progress_comes_from_events_not_a_timer(self, app_js: str):
+        """Rings advance on `subagent_step`. Nothing may creep forward on its
+        own to look busy while a worker is actually stuck."""
+        for handler in ("fanoutStep", "fanoutDone", "drawRing", "refreshOverall"):
+            match = re.search(rf"function {handler}\(.*?\n  \}}", app_js, re.DOTALL)
+            assert match, f"{handler} not found in app.js"
+            assert "setInterval" not in match.group(0)
+            assert "setTimeout" not in match.group(0)
+
+    def test_each_worker_event_reaches_the_panel(self, app_js: str):
+        handler = re.search(r"function handleEvent\(.*?\n  \}\n", app_js, re.DOTALL)
+        assert handler
+        body = handler.group(0)
+        for event in ("subagents_start", "subagent_step", "subagent_tool_end",
+                      "subagent_finding", "subagent_done", "subagents_end"):
+            assert f'case "{event}"' in body, f"{event} is not handled"
+
+    def test_a_failed_worker_is_shown_as_failed(self, app_js: str):
+        """A worker that died must not sit in the panel looking like it is
+        still thinking."""
+        assert 'case "subagent_error"' in app_js
+        assert re.search(r"function fanoutFailed\(", app_js)
+
+    def test_worker_names_are_escaped_into_the_lane(self, app_js: str):
+        """Worker names are chosen by the model from an untrusted repository
+        and are written into the lane with innerHTML."""
+        match = re.search(r"function buildLane\(.*?\n  \}", app_js, re.DOTALL)
+        assert match and "escapeHtml(name)" in match.group(0)
+
+    def test_the_ring_geometry_is_derived_not_guessed(self, app_js: str):
+        """A hard-coded dash length silently stops matching the radius the
+        moment the ring is resized."""
+        assert re.search(r"RING_LENGTH = 2 \* Math\.PI \* RING_RADIUS", app_js)
+
+    def test_the_panel_is_themed(self, css: str):
+        match = re.search(r"^\.fanout \{([^}]*)\}", css, re.MULTILINE)
+        assert match, ".fanout rule not found in style.css"
+        body = match.group(1)
+        assert "var(--" in body
+        assert not re.search(r"#[0-9a-fA-F]{3,6}\b", body), (
+            "hard-coded colour in .fanout — it will not follow the theme"
+        )
+
+    def test_the_panel_sits_below_the_modal(self, css: str):
+        """Otherwise it covers the diff review it is meant to sit beside."""
+        fanout = re.search(r"^\.fanout \{([^}]*)\}", css, re.MULTILINE).group(1)
+        modal = re.search(r"^\.modal \{([^}]*)\}", css, re.MULTILINE).group(1)
+        fanout_z = int(re.search(r"z-index:\s*(\d+)", fanout).group(1))
+        modal_z = int(re.search(r"z-index:\s*(\d+)", modal).group(1))
+        assert fanout_z < modal_z
+
+    def test_popping_out_moves_the_live_node(self, app_js: str):
+        """A copy would need a second set of bindings kept in sync with the
+        first. Moving the node keeps every existing element reference valid."""
+        match = re.search(r"function popOutFanout\(.*?\n  \}", app_js, re.DOTALL)
+        assert match and "adoptNode" in match.group(0)
+
+    def test_a_blocked_popup_is_reported(self, app_js: str):
+        """window.open returns null when blocked, and silently doing nothing
+        looks like a broken button."""
+        match = re.search(r"function popOutFanout\(.*?\n  \}", app_js, re.DOTALL)
+        assert match and re.search(r"if \(!win\)", match.group(0))
+
+    def test_only_same_origin_styles_are_copied_into_the_popup(self, app_js: str):
+        match = re.search(r"function popOutFanout\(.*?\n  \}", app_js, re.DOTALL)
+        assert match and "location.origin" in match.group(0)
+
+    def test_the_popup_does_not_outlive_the_page_feeding_it(self, app_js: str):
+        """Its lanes only update from this page's event stream, so an orphaned
+        window would sit frozen showing a run that is long over."""
+        assert re.search(r'window\.addEventListener\("beforeunload"', app_js)

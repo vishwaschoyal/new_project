@@ -44,6 +44,9 @@
     reviewDiff: $("review-diff"), discardTask: $("discard-task"),
     uInput: $("u-input"), uCached: $("u-cached"), uOutput: $("u-output"),
     uCost: $("u-cost"), cacheFill: $("cache-fill"), cacheLabel: $("cache-label"),
+    fanout: $("fanout"), fanoutLanes: $("fanout-lanes"), fanoutSub: $("fanout-sub"),
+    fanoutFoot: $("fanout-foot"), fanoutOverallFill: $("fanout-overall-fill"),
+    fanoutPop: $("fanout-pop"), fanoutClose: $("fanout-close"),
   };
 
   // ── safe rendering ───────────────────────────────────────────────────
@@ -453,17 +456,41 @@
     return wrapper;
   }
 
+  // Markdown is not incrementally parseable, so every delta forces a full
+  // re-render of the accumulated text — a half-written code fence rendered
+  // as plain text then reflowed looks worse than re-parsing. But SSE deltas
+  // can arrive many times a second, faster than the screen can repaint, so
+  // re-rendering on every single one repaints the whole message body more
+  // often than the display ever shows it: that's the streaming jank. Coalesce
+  // to one render per animation frame — the network can outrun the network,
+  // it should not be allowed to outrun the screen.
+  const pendingRenderFrames = new WeakMap();
+
+  function scheduleBodyRender(body) {
+    if (pendingRenderFrames.has(body)) return;
+    const frame = requestAnimationFrame(() => {
+      pendingRenderFrames.delete(body);
+      body.innerHTML = renderMarkdown(body.dataset.raw);
+      scrollToBottom();
+    });
+    pendingRenderFrames.set(body, frame);
+  }
+
   function appendDelta(node, delta) {
     const body = node.querySelector(".msg-body");
     body.dataset.raw = (body.dataset.raw || "") + delta;
-    // Re-render each delta: Markdown is not incrementally parseable, and a
-    // half-written code fence rendered as text then reflowed looks broken.
-    body.innerHTML = renderMarkdown(body.dataset.raw);
-    scrollToBottom();
+    scheduleBodyRender(body);
   }
 
   function finishMessage(node) {
     const body = node.querySelector(".msg-body");
+    // A frame still queued from the last delta would otherwise land after
+    // this render and wipe out the highlighting/citation links below it.
+    const frame = pendingRenderFrames.get(body);
+    if (frame !== undefined) {
+      cancelAnimationFrame(frame);
+      pendingRenderFrames.delete(body);
+    }
     body.innerHTML = renderMarkdown(body.dataset.raw || body.textContent);
     highlight(body);
     linkifyCitations(body);
@@ -474,30 +501,355 @@
   }
 
   // ── tool trail ───────────────────────────────────────────────────────
+  /* Two layers, not one flat list.
+   *
+   * Narration ("say" lines) is the primary, always-visible feed — it is
+   * what the run is doing, in sentences. Every raw tool call that produced
+   * those sentences still exists, but nested inside its own collapsed
+   * dropdown: the evidence for the narration, available on demand, not
+   * competing with it for attention by default. */
   function createTrail(node) {
     const trail = document.createElement("details");
     trail.className = "trail";
     trail.open = true;
-    trail.innerHTML = `<summary><span class="trail-count">0</span> steps</summary><ol></ol>`;
+    trail.innerHTML = `
+      <summary><span class="trail-count">0</span> steps</summary>
+      <div class="narration"></div>
+      <details class="steps">
+        <summary><span class="steps-count">0</span> tool call(s)</summary>
+        <ol></ol>
+      </details>`;
     node.prepend(trail);
     return trail;
   }
 
   function trailAdd(trail, label, kind = "") {
-    const list = trail.querySelector("ol");
     const item = document.createElement("li");
     item.className = kind;
     item.innerHTML = label;
-    list.append(item);
-    trail.querySelector(".trail-count").textContent = list.children.length;
+
+    if (kind === "say") {
+      // Only one line is ever "in progress" — the one just added. The glow
+      // marks *that*, not a decoration that runs on its own timer.
+      trail.querySelectorAll(".narration li.current").forEach((n) => n.classList.remove("current"));
+      item.classList.add("current");
+      trail.querySelector(".narration").append(item);
+    } else {
+      const list = trail.querySelector(".steps ol");
+      list.append(item);
+      trail.querySelector(".steps-count").textContent = list.children.length;
+    }
+
+    const total = trail.querySelectorAll(".narration li, .steps ol li").length;
+    trail.querySelector(".trail-count").textContent = total;
     scrollToBottom();
     return item;
   }
 
+  /* Freeze the glow once the run is over — a pulsing line under a finished
+   * answer reads as still-working, which is exactly wrong. */
+  function trailSettle(trail) {
+    trail.querySelectorAll(".narration li.current").forEach((n) => n.classList.remove("current"));
+  }
+
   const TOOL_ICON = {
-    grep: "⌕", glob: "▤", read: "▤", bash: "$", edit: "✎",
+    grep: "⌕", glob: "▤", read: "▤", bash: "$", edit: "✎", create: "＋",
     run_check: "▶", record_finding: "✓", add_question: "?", delegate: "⑃",
   };
+
+  // ── narration ────────────────────────────────────────────────────────
+  /* Plain-language commentary on the run, derived here from stream events.
+   *
+   * It is deliberately *not* the model's inner monologue. The loop never sends
+   * its reasoning to the browser, and writing prose that pretends to be it
+   * would be the same class of mistake the evidence ledger exists to prevent:
+   * text that reads like a report of something real and is not. Every line
+   * below is triggered by an event that actually occurred and says only what
+   * that event means. When nothing happens, nothing is narrated.
+   *
+   * Lines are emitted on a change of activity rather than per tool call — a
+   * sentence in front of all forty reads would be noise, not narration. */
+  const PHASE_OF = {
+    grep: "search", glob: "search", read: "read", bash: "inspect",
+    edit: "edit", create: "create", run_check: "verify", delegate: "delegate",
+  };
+
+  // Several phrasings per phase so a search → read → search rhythm does not
+  // repeat one sentence verbatim down the whole trail. Same fact, said again.
+  const PHRASES = {
+    search: [
+      (a) => `Starting with a search for <em>${a.pattern || a.match || ""}</em>.`,
+      (a) => `Looking for <em>${a.pattern || a.match || ""}</em>.`,
+      (a) => `Back to searching — this time <em>${a.pattern || a.match || ""}</em>.`,
+    ],
+    read: [
+      (a) => `Found a lead. Reading <em>${a.path || ""}</em>.`,
+      (a) => `Opening <em>${a.path || ""}</em> to see what it actually does.`,
+      (a) => `Following the trail into <em>${a.path || ""}</em>.`,
+    ],
+    inspect: [
+      (a) => `Asking git directly: <em>${a.command || ""}</em>.`,
+      (a) => `Checking the repository itself: <em>${a.command || ""}</em>.`,
+    ],
+    edit: [
+      (a) => `I know enough to change it. Editing <em>${a.path || ""}</em>.`,
+      (a) => `Making another change, in <em>${a.path || ""}</em>.`,
+    ],
+    create: [
+      (a) => `This needs a file that doesn't exist yet — creating <em>${a.path || ""}</em>.`,
+      (a) => `Adding another new file: <em>${a.path || ""}</em>.`,
+    ],
+    verify: [
+      (a) => `The change is in. Running <em>${a.command || ""}</em> to see if it holds.`,
+      (a) => `Checking again: <em>${a.command || ""}</em>.`,
+    ],
+    delegate: [
+      () => `These parts don't depend on each other, so I'll investigate them side by side.`,
+    ],
+  };
+
+  function narrate(trail, html) {
+    if (html) trailAdd(trail, html, "say");
+  }
+
+  /* One narration line when the kind of work changes, and only then. */
+  function narrateTool(ctx, tool, args = {}) {
+    const phase = PHASE_OF[tool];
+    if (!phase || phase === ctx.phase) return;
+    ctx.phase = phase;
+
+    const options = PHRASES[phase];
+    if (!options) return;
+    const seen = ctx.phaseCounts.get(phase) || 0;
+    ctx.phaseCounts.set(phase, seen + 1);
+
+    const safe = {};
+    Object.keys(args || {}).forEach((key) => { safe[key] = escapeHtml(args[key]); });
+    narrate(ctx.trail, options[Math.min(seen, options.length - 1)](safe));
+  }
+
+  // ── live fanout view ─────────────────────────────────────────────────
+  /* A lane per subagent, driven entirely by the stream.
+   *
+   * The flat trail is a log: one list, in the order things happened. That is
+   * the wrong shape for parallel work — four workers interleave into it and
+   * you cannot see who is where. This panel is the same events arranged by
+   * *worker* instead of by time, which is the only view in which "three are
+   * done and one is still reading" is a thing you can see at a glance.
+   *
+   * Every number rendered here arrives in an event. Progress rings show steps
+   * actually taken against the worker's real ceiling; nothing creeps forward
+   * on a timer to look busy. */
+  const RING_RADIUS = 19;
+  const RING_LENGTH = 2 * Math.PI * RING_RADIUS;
+
+  const fan = { lanes: new Map(), startedAt: 0, window: null };
+
+  function fanoutReset() {
+    fan.lanes.clear();
+    el.fanoutLanes.innerHTML = "";
+    el.fanoutFoot.textContent = "";
+    setOverall(0);
+    // A popped-out window stays open across runs, so it says what it is
+    // waiting for rather than sitting blank.
+    if (fan.window) el.fanoutSub.textContent = "waiting for parallel work…";
+    else { el.fanoutSub.textContent = ""; el.fanout.hidden = true; }
+  }
+
+  const setOverall = (fraction) => {
+    el.fanoutOverallFill.style.width = `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`;
+  };
+
+  function buildLane(name, objective, stepsTotal) {
+    const lane = document.createElement("div");
+    lane.className = "lane";
+    lane.innerHTML = `
+      <svg class="ring" viewBox="0 0 46 46" aria-hidden="true">
+        <circle class="ring-track" cx="23" cy="23" r="${RING_RADIUS}"></circle>
+        <circle class="ring-fill" cx="23" cy="23" r="${RING_RADIUS}"
+                stroke-dasharray="${RING_LENGTH}" stroke-dashoffset="${RING_LENGTH}"></circle>
+        <text class="ring-label" x="23" y="27">0</text>
+      </svg>
+      <div class="lane-body">
+        <div class="lane-name">
+          <span class="lane-dot"></span>${escapeHtml(name)}
+          <span class="lane-reason"></span>
+        </div>
+        <div class="lane-activity current">starting…</div>
+        <div class="lane-stats">
+          <span class="hits">0 findings</span><span class="files">0 files</span><span class="cost"></span>
+        </div>
+        <details class="lane-log">
+          <summary><span class="lane-log-count">0</span> step(s)</summary>
+          <ol></ol>
+        </details>
+      </div>`;
+    lane.title = objective || name;
+    el.fanoutLanes.append(lane);
+
+    return {
+      root: lane,
+      fill: lane.querySelector(".ring-fill"),
+      label: lane.querySelector(".ring-label"),
+      reason: lane.querySelector(".lane-reason"),
+      activity: lane.querySelector(".lane-activity"),
+      hits: lane.querySelector(".hits"),
+      files: lane.querySelector(".files"),
+      cost: lane.querySelector(".cost"),
+      log: lane.querySelector(".lane-log ol"),
+      logCount: lane.querySelector(".lane-log-count"),
+      steps: 0, total: stepsTotal || 12, findings: 0, done: false,
+    };
+  }
+
+  /* One entry in a worker's own log — the detail behind its one-line
+   * activity summary, kept per-worker so it never interleaves with the
+   * other lanes the way the flat trail does. */
+  function laneLog(lane, html, kind = "") {
+    const item = document.createElement("li");
+    item.className = kind;
+    item.innerHTML = html;
+    lane.log.append(item);
+    lane.logCount.textContent = lane.log.children.length;
+  }
+
+  function fanoutOpen(data) {
+    fanoutReset();
+    fan.startedAt = Date.now();
+    const objectives = data.objectives || {};
+    (data.names || []).forEach((name) => {
+      fan.lanes.set(name, buildLane(name, objectives[name], data.steps_each));
+    });
+    el.fanoutSub.textContent = `${data.count} workers · ${(data.budget_each || 0).toLocaleString()} tokens each`;
+    el.fanoutFoot.textContent = "running…";
+    el.fanout.hidden = false;
+  }
+
+  function drawRing(lane) {
+    const fraction = lane.total ? Math.min(1, lane.steps / lane.total) : 0;
+    lane.fill.setAttribute("stroke-dashoffset", String(RING_LENGTH * (1 - fraction)));
+    lane.label.textContent = String(lane.steps);
+    refreshOverall();
+  }
+
+  function refreshOverall() {
+    let used = 0;
+    let total = 0;
+    fan.lanes.forEach((lane) => {
+      // A finished worker counts as its whole ring however early it stopped —
+      // otherwise the bar reads as unfinished work that is not coming.
+      used += lane.done ? lane.total : lane.steps;
+      total += lane.total;
+    });
+    setOverall(total ? used / total : 0);
+  }
+
+  function fanoutStep(data) {
+    const lane = fan.lanes.get(data.worker);
+    if (!lane || lane.done) return;
+    lane.steps = data.step || lane.steps;
+    lane.total = data.total || lane.total;
+    drawRing(lane);
+  }
+
+  /* `html` is trusted at the call site (built with escapeHtml already) — the
+   * same contract trailAdd has, since this is the per-worker equivalent of it. */
+  function fanoutActivity(worker, html) {
+    const lane = fan.lanes.get(worker);
+    if (!lane || lane.done) return;
+    lane.activity.innerHTML = html;
+    laneLog(lane, html);
+  }
+
+  function fanoutFinding(worker, claim, reference) {
+    const lane = fan.lanes.get(worker);
+    if (!lane) return;
+    lane.findings += 1;
+    lane.hits.textContent = `${lane.findings} finding${lane.findings === 1 ? "" : "s"}`;
+    laneLog(lane, `<span class="good">✓</span> ${escapeHtml(claim)} <code>${escapeHtml(reference)}</code>`, "finding");
+  }
+
+  function fanoutDone(data) {
+    const lane = fan.lanes.get(data.worker);
+    if (!lane) return;
+    lane.done = true;
+    lane.steps = data.steps_used ?? lane.steps;
+    lane.root.classList.add("done");
+    lane.activity.classList.remove("current");
+    lane.activity.textContent = `finished in ${data.wall_seconds}s`;
+    lane.reason.textContent = data.termination_reason || "";
+    lane.hits.textContent = `${data.findings} finding${data.findings === 1 ? "" : "s"}`;
+    lane.files.textContent = `${data.files} file${data.files === 1 ? "" : "s"}`;
+    lane.cost.textContent = `$${(data.cost_usd || 0).toFixed(4)}`;
+    laneLog(lane, `Finished in ${data.wall_seconds}s — ${data.findings} finding(s), $${(data.cost_usd || 0).toFixed(4)}.`);
+    drawRing(lane);
+  }
+
+  function fanoutFailed(worker, message) {
+    const lane = fan.lanes.get(worker);
+    if (!lane) return;
+    lane.done = true;
+    lane.root.classList.add("failed");
+    lane.activity.classList.remove("current");
+    lane.activity.textContent = message || "failed";
+    lane.reason.textContent = "failed";
+    laneLog(lane, `<span class="bad">✕ ${escapeHtml(message || "failed")}</span>`, "bad");
+    refreshOverall();
+  }
+
+  function fanoutEnd(data) {
+    setOverall(1);
+    const seconds = fan.startedAt ? Math.round((Date.now() - fan.startedAt) / 1000) : 0;
+    el.fanoutFoot.textContent =
+      `${data.count} workers · ${data.evidence_merged} findings merged · ${seconds}s wall clock`;
+  }
+
+  /* Pop the panel into a window of its own.
+   *
+   * The live node is *moved* rather than copied: adoptNode keeps every element
+   * reference the update functions above are holding, so they carry on writing
+   * into the new window without knowing it moved. A copy would need a second
+   * set of bindings kept in sync, which is two things to get wrong instead of
+   * none. Opening happens on a click so the popup blocker allows it. */
+  function popOutFanout() {
+    if (fan.window && !fan.window.closed) return fan.window.focus();
+
+    const win = window.open("", "acw-fanout", "width=430,height=640,menubar=no,toolbar=no");
+    if (!win) return toast("Your browser blocked the popup — allow popups for this page.", "warn");
+
+    win.document.title = "Parallel investigation";
+    const meta = win.document.createElement("meta");
+    meta.name = "color-scheme";
+    meta.content = "light dark";
+    win.document.head.append(meta);
+
+    // Same-origin stylesheets only: the CDN ones style code blocks this panel
+    // does not contain.
+    document.querySelectorAll('link[rel="stylesheet"]').forEach((sheet) => {
+      if (new URL(sheet.href, location.href).origin !== location.origin) return;
+      const copy = win.document.createElement("link");
+      copy.rel = "stylesheet";
+      copy.href = sheet.href;
+      win.document.head.append(copy);
+    });
+    win.document.body.style.margin = "0";
+    win.document.body.append(win.document.adoptNode(el.fanout));
+
+    el.fanout.classList.add("popped");
+    el.fanout.hidden = false;
+    el.fanoutPop.hidden = true;
+    fan.window = win;
+
+    win.addEventListener("beforeunload", dockFanout);
+  }
+
+  function dockFanout() {
+    if (!fan.window) return;
+    document.body.append(document.adoptNode(el.fanout));
+    el.fanout.classList.remove("popped");
+    el.fanoutPop.hidden = false;
+    fan.window = null;
+  }
 
   // ── usage ────────────────────────────────────────────────────────────
   function resetUsage() {
@@ -549,9 +901,20 @@
 
     const node = addMessage("assistant", "");
     const trail = createTrail(node);
-    const pending = new Map();
     let sawContent = false;
 
+    // One context object for the whole run, not one per frame: the narration
+    // only knows to stay quiet because it remembers the phase it last spoke
+    // about, and a fresh object every event would forget that immediately.
+    const ctx = {
+      node, trail,
+      pending: new Map(),
+      phase: null,
+      phaseCounts: new Map(),
+      onContent: () => { sawContent = true; },
+    };
+
+    fanoutReset();
     state.controller = new AbortController();
 
     try {
@@ -592,11 +955,12 @@
           if (!raw) continue;
           let data;
           try { data = JSON.parse(raw); } catch { continue; }
-          handleEvent(type, data, { node, trail, pending, onContent: () => { sawContent = true; } });
+          handleEvent(type, data, ctx);
         }
       }
     } catch (error) {
       if (error.name !== "AbortError") {
+        trailSettle(trail);
         trailAdd(trail, `<span class="bad">✕ ${escapeHtml(error.message)}</span>`, "bad");
         toast(error.message, "error");
       }
@@ -618,6 +982,7 @@
 
     switch (type) {
       case "tool_start": {
+        narrateTool(ctx, data.tool, data.arguments);
         const icon = TOOL_ICON[data.tool] || "•";
         const args = escapeHtml(summariseArgs(data.tool, data.arguments));
         const item = trailAdd(trail, `<span class="spin">${icon}</span> <b>${escapeHtml(data.tool)}</b> ${args}`, "running");
@@ -642,24 +1007,61 @@
       case "subagents_start":
         trailAdd(trail, `<span class="fan">⑃</span> delegating to ${data.count} workers:
                  ${escapeHtml((data.names || []).join(", "))}`, "fan");
+        narrate(trail, `${data.count} workers are running now — ${
+          escapeHtml((data.names || []).join(", "))}. Waiting for them to report back.`);
+        fanoutOpen(data);
         break;
-      case "subagent_tool_end":
+      case "subagent_step":
+        fanoutStep(data);
+        break;
+      case "subagent_tool_start": {
+        const icon = TOOL_ICON[data.tool] || "•";
+        fanoutActivity(data.worker, `<span class="lane-icon">${icon}</span>
+                 ${escapeHtml(data.tool)} ${escapeHtml(summariseArgs(data.tool, data.arguments))}`);
+        break;
+      }
+      case "subagent_tool_end": {
         trailAdd(trail, `<span class="worker">${escapeHtml(data.worker)}</span>
                  ${escapeHtml(data.name)} — ${escapeHtml(data.summary || "")}`, "sub");
+        const mark = data.ok ? "✓" : "✕";
+        fanoutActivity(data.worker, `<span class="${data.ok ? "good" : "bad"}">${mark}</span>
+                 ${escapeHtml(data.name)} — ${escapeHtml(data.summary || "")}`);
         break;
+      }
       case "subagent_finding":
         trailAdd(trail, `<span class="worker">${escapeHtml(data.worker)}</span>
                  ${escapeHtml(data.claim)} <code>${escapeHtml(data.reference)}</code>`, "sub finding");
+        fanoutFinding(data.worker, data.claim, data.reference);
+        break;
+      case "subagent_done":
+        narrate(trail, `<em>${escapeHtml(data.worker)}</em> is back with ${data.findings}
+                 finding(s) from ${data.files} file(s).`);
+        fanoutDone(data);
+        break;
+      case "subagent_error":
+        trailAdd(trail, `<span class="bad">✕ ${escapeHtml(data.worker)} failed:
+                 ${escapeHtml(data.message || "")}</span>`, "bad");
+        fanoutFailed(data.worker, data.message);
         break;
       case "subagents_end":
         trailAdd(trail, `<span class="fan">⑃</span> merged ${data.evidence_merged} findings
                  from ${data.count} workers`, "fan");
+        narrate(trail, `Everyone has reported. Folding ${data.evidence_merged} finding(s)
+                 into one answer — no need to re-read what they already covered.`);
+        fanoutEnd(data);
         break;
       case "compaction":
         trailAdd(trail, `<span class="dim">⌫ compacted ${data.observations} observations</span>`, "dim");
+        narrate(trail, `Context is getting long, so I'm setting aside ${data.observations}
+                 older tool outputs. Anything I recorded as a finding stays.`);
         break;
       case "challenge":
         trailAdd(trail, `<span class="warn">↻ not finished — parts of the question remain open</span>`, "warn");
+        narrate(trail, `I was about to answer, but part of the question is still open. Going back for it.`);
+        ctx.phase = null;   // the next tool call starts a fresh stretch of work
+        break;
+      case "finalising":
+        narrate(trail, `That's enough to answer with. Writing it up from what I recorded.`);
         break;
       case "content":
         ctx.onContent();
@@ -670,6 +1072,7 @@
         break;
       case "done":
         trail.open = false;
+        trailSettle(trail);
         if (data.unsupported_citations?.length) {
           trailAdd(trail, `<span class="warn">⚠ ${data.unsupported_citations.length}
                    unverified citation(s) removed</span>`, "warn");
@@ -677,6 +1080,7 @@
         renderDoneFooter(node, data);
         break;
       case "error":
+        trailSettle(trail);
         trailAdd(trail, `<span class="bad">✕ ${escapeHtml(data.message)}</span>`, "bad");
         break;
     }
@@ -688,6 +1092,7 @@
     if (tool === "read") return `${args.path || ""}${args.offset ? `:${args.offset}` : ""}`;
     if (tool === "bash" || tool === "run_check") return args.command || "";
     if (tool === "edit") return args.path || "";
+    if (tool === "create") return args.path || "";
     if (tool === "record_finding") return args.claim || "";
     if (tool === "delegate") return `${(args.tasks || []).length} tasks`;
     return "";
@@ -857,6 +1262,16 @@
     await refreshTask();
     await loadBranches();
   });
+  el.fanoutPop.addEventListener("click", popOutFanout);
+  el.fanoutClose.addEventListener("click", () => {
+    if (fan.window) { fan.window.close(); return; }   // beforeunload docks it
+    el.fanout.hidden = true;
+  });
+  // A popup outliving the page that feeds it would sit there frozen.
+  window.addEventListener("beforeunload", () => {
+    if (fan.window && !fan.window.closed) fan.window.close();
+  });
+
   el.modalClose.addEventListener("click", closeModal);
   el.modal.addEventListener("click", (e) => { if (e.target === el.modal) closeModal(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeModal(); });
