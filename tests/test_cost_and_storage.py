@@ -21,7 +21,7 @@ class FakeResponse:
 
 class TestPricing:
     def test_known_model(self):
-        assert pricing_for("gpt-5.4-mini")["input"] == 0.25
+        assert pricing_for("gpt-5.4-mini")["input"] == 0.75
 
     def test_prefix_match_picks_longest(self):
         assert pricing_for("gpt-5.4-mini-2026-01-01") == pricing_for("gpt-5.4-mini")
@@ -36,7 +36,7 @@ class TestPricing:
             "gpt-5.4-mini", input_tokens=1_000_000, cached_input_tokens=1_000_000
         )
         assert cached < full
-        assert cached == pytest.approx(0.025)
+        assert cached == pytest.approx(0.075)
 
     def test_cost_is_zero_for_no_usage(self):
         assert compute_cost("gpt-5.4-mini", input_tokens=0) == 0.0

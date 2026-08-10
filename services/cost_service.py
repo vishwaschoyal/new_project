@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 # `cached_input` is the discounted rate for prompt-cache hits.
 PRICING: dict[str, dict[str, float]] = {
     "gpt-5.4":       {"input": 1.25, "cached_input": 0.125, "output": 10.00},
-    "gpt-5.4-mini":  {"input": 0.25, "cached_input": 0.025, "output": 2.00},
+    "gpt-5.4-mini":  {"input": 0.75, "cached_input": 0.075, "output": 4.50},
     "gpt-5":         {"input": 1.25, "cached_input": 0.125, "output": 10.00},
     "gpt-5-mini":    {"input": 0.25, "cached_input": 0.025, "output": 2.00},
     "gpt-4.1":       {"input": 2.00, "cached_input": 0.50,  "output": 8.00},

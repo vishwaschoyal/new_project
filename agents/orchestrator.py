@@ -68,10 +68,10 @@ MAX_DELEGATE_OBSERVATION_CHARS = 16_000
 # *in the middle* of the list, and provider prompt caching matches on an exact
 # prefix. Editing message k makes every message from k onward a cache miss.
 #
-# Priced on this project's own table (gpt-5.4-mini: $0.025/M cached vs
-# $0.25/M uncached, a 10x discount), carrying 6k tokens of already-cached
-# context costs ~$0.00015 a step, while compacting forces ~20k tokens to be
-# re-billed uncached at ~$0.005. Routine compaction spent about 30x what it
+# Priced on this project's own table (gpt-5.4-mini: $0.075/M cached vs
+# $0.75/M uncached, a 10x discount), carrying 6k tokens of already-cached
+# context costs ~$0.00045 a step, while compacting forces ~20k tokens to be
+# re-billed uncached at ~$0.015. Routine compaction spent about 30x what it
 # saved. It belongs near the context limit, as a valve, not as hygiene.
 COMPACTION_TRIGGER_CHARS = 140_000
 # Never compact the most recent observations — the model is still using them.
