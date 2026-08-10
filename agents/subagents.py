@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from agents import prompts
 from agents.evidence import EvidenceLedger
-from config import LIMITS
+from config import LIMITS, SUBAGENT_PROMPT_CACHE_KEY
 from tools.base import ToolResult
 from tools.registry import Capability
 
@@ -156,6 +156,10 @@ def run_delegation(parent: "Orchestrator", arguments: dict[str, Any]) -> ToolRes
             ledger=EvidenceLedger(workspace=parent.workspace),
             name=worker_name,
             allow_delegation=False,           # workers cannot fan out again
+            # All workers share one system prompt and tool set, so they are one
+            # cacheable prefix and belong under one routing key — a different
+            # one from the parent, whose prefix they would otherwise displace.
+            prompt_cache_key=SUBAGENT_PROMPT_CACHE_KEY,
         )
         result = worker.run()
 

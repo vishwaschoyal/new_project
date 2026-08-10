@@ -381,6 +381,29 @@ class EvidenceLedger:
         window = "\n".join(lines[start - 1 : end])
         return not any(_mentions(window, name) for name in names)
 
+    def _citation_contradicted(
+        self, citation: Citation, line: str, previous: str, cache: dict[str, list[str] | None]
+    ) -> bool:
+        """Decide contradiction for one citation, robust to where it sits.
+
+        A citation is checked against both its own line and that line plus the
+        one before it, and previously both had to agree — deliberately, so a
+        one-off bad match on a short line could not delete a true citation. But
+        a citation that trails alone on its own line (the common shape: a
+        sentence, then `path:line` by itself) leaves nothing on that line once
+        the citation syntax is stripped out, so ``_contradicted`` always found
+        no names to check and silently vetoed the other check. When a line has
+        no identifiers of its own to test, it has no vote; only checks that
+        found something to look for count.
+        """
+        combined = f"{previous}\n{line}"
+        votes = []
+        if _identifiers(CITATION_RE.sub(" ", line)):
+            votes.append(self._contradicted(citation, line, cache))
+        if _identifiers(CITATION_RE.sub(" ", combined)):
+            votes.append(self._contradicted(citation, combined, cache))
+        return bool(votes) and all(votes)
+
     def verify_answer(self, answer: str) -> dict[str, Any]:
         """Sort an answer's citations into supported, unsupported, contradicted.
 
@@ -405,11 +428,7 @@ class EvidenceLedger:
 
                 if not self.was_observed(citation.path, citation.start_line, citation.end_line):
                     unsupported.append(citation)
-                elif self._contradicted(citation, line, cache) and self._contradicted(
-                    citation, f"{previous}\n{line}", cache
-                ):
-                    # Checked twice: once against the line, once with the line
-                    # before it. A trailing citation keeps its context that way.
+                elif self._citation_contradicted(citation, line, previous, cache):
                     contradicted.append(citation)
                 else:
                     supported.append(citation)
@@ -422,12 +441,25 @@ class EvidenceLedger:
         }
 
     # -- prompt rendering -------------------------------------------------
-    def render_for_prompt(self, *, limit: int = 30) -> str:
-        """Compact evidence block that replaces trimmed raw observations."""
-        records = self.records[-limit:]
+    def render_for_prompt(self, *, limit: int | None = 30) -> str:
+        """Compact evidence block that replaces trimmed raw observations.
+
+        ``limit=None`` renders everything, which is what finalisation wants:
+        a finding trimmed out of this block is a finding the answer cannot
+        cite. Stepping passes a small limit instead, because this block is
+        re-sent uncached on every step and older findings are still visible
+        in the raw observations above it.
+        """
+        all_records = self.records
+        records = all_records if limit is None else all_records[-limit:]
         if not records:
             return "No evidence recorded yet."
         lines = []
+        if len(records) < len(all_records):
+            lines.append(
+                f"({len(all_records) - len(records)} earlier finding(s) still held "
+                f"and available when you write the answer.)"
+            )
         for record in records:
             attribution = "" if record.source == "main" else f" [via {record.source}]"
             lines.append(f"- {record.claim} ({record.citation}){attribution}")

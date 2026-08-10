@@ -94,7 +94,15 @@ def grep(
         # ripgrep drops the filename prefix when handed exactly one file, which
         # would leave the parser below reading the line number as the path.
         "--with-filename",
-        "--max-count", "10",          # per file, so one file cannot fill the budget
+        # Ripgrep's --max-count is per file, not per search. It used to be
+        # hardcoded to 10 "so one file cannot fill the budget" — but a search
+        # scoped to (or effectively narrowed to) one file then silently loses
+        # every match past the 10th line of that file, with the tool's own
+        # `truncated` flag staying False because the overall result count
+        # never reached `limit`. Capping at the real budget instead means the
+        # worst case is one very-matchy file filling the whole result list,
+        # which is still bounded and, unlike the old behaviour, visible.
+        "--max-count", str(limit),
         "--max-columns", "300",
         "--max-filesize", "1M",
         *_RG_EXCLUDES,
@@ -213,7 +221,7 @@ def read(
     *,
     path: str,
     offset: int = 1,
-    limit: int = LIMITS.max_read_lines,
+    limit: int = LIMITS.default_read_lines,
 ) -> ToolResult:
     """Read a focused line range, returned as ``lineno | text``."""
     try:
@@ -233,7 +241,7 @@ def read(
         )
 
     offset = max(1, int(offset or 1))
-    limit = max(1, min(int(limit or LIMITS.max_read_lines), LIMITS.max_read_lines))
+    limit = max(1, min(int(limit or LIMITS.default_read_lines), LIMITS.max_read_lines))
 
     try:
         with target.open("r", encoding="utf-8", errors="replace") as handle:

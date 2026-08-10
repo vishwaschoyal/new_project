@@ -191,6 +191,30 @@ class TestLoopDiscipline:
 
         assert [call["ok"] for call in result.tool_calls] == [True, True]
 
+    def test_forces_an_answer_after_repeated_refusals(self, repo: Path, monkeypatch):
+        """Regression: in a live run, a weaker model kept retrying one already-
+        refused call twelve times instead of changing approach — a clearer
+        warning message did not stop it, because it was not a wording problem.
+        Past a handful of refusals in one request, the loop must force an
+        answer rather than pay for yet another identical retry.
+        """
+        from agents.orchestrator import MAX_THRASH_REFUSALS
+
+        # The first call is legitimate; each identical repeat after it is a
+        # refusal. Deriving the expectation from the ceiling keeps this test
+        # honest when the ceiling is retuned — a refusal costs a full context
+        # re-send, so that number is expected to move.
+        expected_steps = 1 + MAX_THRASH_REFUSALS
+        script = [
+            turn(calls=[tool_call("grep", pattern="def create_app")])
+            for _ in range(expected_steps + 2)
+        ]
+        orchestrator, _, _ = build(repo, monkeypatch, script, max_steps=30)
+        result = orchestrator.run()
+
+        assert result.termination_reason == "thrash_detected"
+        assert result.steps_used == expected_steps
+
     def test_stops_at_the_step_limit(self, repo: Path, monkeypatch):
         script = [turn(calls=[tool_call("glob", pattern=f"*{i}.py")]) for i in range(20)]
         script.append(turn(text="Finalised."))
@@ -272,15 +296,36 @@ class TestFailureHandling:
 
 class TestContextManagement:
     def test_compacts_when_observations_grow(self, repo: Path, monkeypatch):
+        from agents.orchestrator import (
+            COMPACTION_TRIGGER_CHARS,
+            KEEP_RECENT_OBSERVATIONS,
+            MAX_OBSERVATION_CHARS,
+        )
+
+        # How many distinct reads it takes to push the working context past the
+        # trigger, computed rather than hardcoded: the threshold is a tuning
+        # constant, and a test that pins it silently stops asserting anything
+        # the moment it is raised.
+        per_read = MAX_OBSERVATION_CHARS
+        reads = COMPACTION_TRIGGER_CHARS // per_read + KEEP_RECENT_OBSERVATIONS + 1
+        lines_per_read = 200
+
         big = repo / "big.py"
-        big.write_text("\n".join(f"# padding line {i}" for i in range(4000)), encoding="utf-8")
+        big.write_text(
+            "\n".join(f"# padding line {i}" for i in range(reads * lines_per_read + 10)),
+            encoding="utf-8",
+        )
 
         script = [
-            turn(calls=[tool_call("read", path="big.py", offset=i * 200 + 1, limit=200)])
-            for i in range(8)
+            turn(calls=[tool_call(
+                "read", path="big.py", offset=i * lines_per_read + 1, limit=lines_per_read
+            )])
+            for i in range(reads)
         ]
         script.append(turn(text="Done."))
-        orchestrator, _, events = build(repo, monkeypatch, script, max_steps=10)
+        orchestrator, _, events = build(
+            repo, monkeypatch, script, max_steps=reads + 2, token_budget=1_000_000
+        )
         orchestrator.run()
 
         assert any(event.type == "compaction" for event in events)
@@ -307,6 +352,87 @@ class TestContextManagement:
 
         assert any("Padding starts" in item["claim"] for item in result.evidence)
         assert result.citations
+
+
+class TestBatchedToolCalls:
+    """Several calls arriving in one model response.
+
+    A step re-sends the whole conversation, so the bill is roughly
+    steps x context. Batching independent calls is the loop's main defence
+    against that, and it is worth nothing if the loop mishandles a batch.
+    """
+
+    def test_provider_is_asked_for_batched_calls(self):
+        """The setting that makes batching possible at all."""
+        import inspect
+
+        from config import create_read_loop_model
+
+        source = inspect.getsource(create_read_loop_model)
+        assert '"parallel_tool_calls"] = True' in source
+
+    def test_every_call_in_one_step_runs_and_is_observed(self, repo: Path, monkeypatch):
+        orchestrator, model, _ = build(repo, monkeypatch, [
+            turn(calls=[
+                tool_call("read", path="app.py", offset=1, limit=20),
+                tool_call("glob", pattern="*.py"),
+                tool_call("grep", pattern="def create_app"),
+            ]),
+            # Cites a line the batch actually read, so the answer settles the
+            # obligation and the run is not challenged into extra steps.
+            turn(text="The entry point is `create_app` in app.py:6-8."),
+        ])
+        result = orchestrator.run()
+
+        assert [call["name"] for call in result.tool_calls] == ["read", "glob", "grep"]
+        # One step, not three: that is the entire point.
+        assert {call["step"] for call in result.tool_calls} == {1}
+        assert result.steps_used == 2
+
+        # Each call needs its own observation, or the model sees a batch it
+        # cannot match up to what it asked for.
+        from langchain_core.messages import ToolMessage
+
+        observations = [m for m in orchestrator._messages if isinstance(m, ToolMessage)]
+        assert len(observations) == 3
+        assert [m.name for m in observations] == ["read", "glob", "grep"]
+
+    def test_a_finding_batched_with_the_read_that_earned_it(self, repo: Path, monkeypatch):
+        """The pattern the prompt asks for: no round trip spent on bookkeeping.
+
+        `record_finding` is refused unless the lines were observed, so this
+        also pins the ordering guarantee — the read must be dispatched before
+        the finding that depends on it, within the same batch.
+        """
+        orchestrator, _, _ = build(repo, monkeypatch, [
+            turn(calls=[
+                tool_call("read", path="app.py", offset=1, limit=20),
+                tool_call(
+                    "record_finding",
+                    claim="create_app builds the application",
+                    path="app.py", start_line=6, end_line=8,
+                ),
+            ]),
+            turn(text="The entry point is `create_app` in app.py:6-8."),
+        ])
+        result = orchestrator.run()
+
+        assert result.termination_reason == "answered"
+        assert len(result.evidence) == 1
+        assert len(result.citations) == 1
+        assert result.steps_used == 2
+
+    def test_a_failing_call_does_not_abandon_the_rest_of_its_batch(self, repo: Path, monkeypatch):
+        orchestrator, _, _ = build(repo, monkeypatch, [
+            turn(calls=[
+                tool_call("read", path="does-not-exist.py", offset=1, limit=20),
+                tool_call("glob", pattern="*.py"),
+            ]),
+            turn(text="Done."),
+        ])
+        result = orchestrator.run()
+
+        assert [call["ok"] for call in result.tool_calls] == [False, True]
 
 
 class TestPromptStability:

@@ -63,7 +63,13 @@ READ_LOOP_MODEL = _str("READ_LOOP_MODEL", DEFAULT_READ_LOOP_MODEL)
 # Bumping this key deliberately invalidates the provider-side prompt cache.
 # Change it whenever the system prompt or tool schemas change, otherwise the
 # provider may serve a prefix that no longer matches what we send.
-READ_LOOP_PROMPT_CACHE_KEY = "read-loop-system-tools-v4"
+READ_LOOP_PROMPT_CACHE_KEY = "read-loop-system-tools-v6"
+# Workers run a different system prompt, so they are a different cacheable
+# prefix. The key is a routing hint: sharing one across two prefixes makes the
+# two evict each other on the machine they land on. Giving workers their own
+# means the four of them — who *are* prefix-identical — route together, and
+# they stop competing with the main agent's much longer-lived prefix.
+SUBAGENT_PROMPT_CACHE_KEY = "subagent-system-tools-v6"
 READ_LOOP_PROMPT_CACHE_RETENTION = "24h"
 READ_LOOP_MAX_OUTPUT_TOKENS = 3_000
 
@@ -87,9 +93,19 @@ def create_read_loop_model(
     model_kwargs = dict(client_kwargs.pop("model_kwargs", {}) or {})
     model_kwargs["prompt_cache_key"] = cache_key
     model_kwargs["prompt_cache_retention"] = READ_LOOP_PROMPT_CACHE_RETENTION
-    # Serial tool calls keep the observation order deterministic, which is what
-    # makes the investigation trail reproducible and the evidence auditable.
-    model_kwargs["parallel_tool_calls"] = False
+    # Batched tool calls are the single largest cost lever in the loop.
+    #
+    # A step re-sends every message before it, so the bill is roughly
+    # steps x average-context — quadratic in step count. One call per step
+    # turns "read these three files" into three full context re-sends.
+    #
+    # This was previously False to keep the observation order deterministic,
+    # but the loop does not need the provider's help for that: the
+    # orchestrator iterates `message.tool_calls` and dispatches them one at a
+    # time, in the order the model listed them. Enabling batching changes how
+    # many calls arrive per message, not the order they run in, so the trail
+    # stays exactly as reproducible and auditable as it was.
+    model_kwargs["parallel_tool_calls"] = True
 
     client_kwargs.setdefault("cache", False)
 
@@ -123,6 +139,13 @@ class Limits:
     max_grep_matches: int = 60
     max_glob_paths: int = 100
     max_read_lines: int = 250
+    # What an omitted `limit` actually gets. The tool schema has always
+    # advertised 120, but the handler defaulted to `max_read_lines` — so a
+    # model that trusted the description and left `limit` off was billed for
+    # 250 lines. That is roughly double the tokens per read, and the extra
+    # lines widen every subsequent range enough to trip the redundant-read
+    # refusal, which costs a step on top of the tokens.
+    default_read_lines: int = 120
     max_tool_output_chars: int = 12_000
     tool_timeout_seconds: int = 20
 

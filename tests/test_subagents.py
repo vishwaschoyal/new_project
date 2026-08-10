@@ -294,9 +294,15 @@ class TestDelegationSurvivesCompaction:
             ToolMessage(content=result.content, tool_call_id="d1", name="delegate")
         )
         # Ordinary observations, recent enough to be compaction candidates.
-        for index in range(8):
+        # Enough of them to actually cross the trigger, derived from it so that
+        # retuning the threshold does not turn this into a no-op assertion.
+        from agents.orchestrator import COMPACTION_TRIGGER_CHARS, KEEP_RECENT_OBSERVATIONS
+
+        filler_chars = 6_000
+        fillers = COMPACTION_TRIGGER_CHARS // filler_chars + KEEP_RECENT_OBSERVATIONS + 1
+        for index in range(fillers):
             parent._messages.append(
-                ToolMessage(content="x" * 6_000, tool_call_id=f"r{index}", name="read")
+                ToolMessage(content="x" * filler_chars, tool_call_id=f"r{index}", name="read")
             )
 
         parent._compact_if_needed()

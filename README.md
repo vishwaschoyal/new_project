@@ -76,11 +76,19 @@ final answer losing the coordinates it depends on.
 
 ## Cost control
 
-Built in from the start, not bolted on:
+Every step re-sends the whole conversation, so a request costs roughly
+`steps × context` — **quadratic in step count**. Cutting steps therefore beats
+shrinking context, and the controls are ordered accordingly:
 
-- provider-side prompt caching on a stable system/tool prefix
+- **batched tool calls** — independent calls go out in one response, so four
+  reads are one step, not four. Measured on an 80-call investigation, batching
+  in fours cuts input tokens 71% (2.05M → 0.60M) for identical tool calls and
+  identical citations
+- an append-only message list, so the provider's prompt cache keeps matching;
+  compaction rewrites history and is held back for genuine context pressure
+- a stable system/tool prefix, kept bound even at finalisation (`tool_choice`
+  `= "none"`) so the largest request of the run is still a cache hit
 - small bounded tool observations instead of whole files
-- old raw observations replaced by compact evidence
 - early stopping once the question is settled
 - a per-request token budget with a reserve held back for the final answer
 - input, cached-input, output, and reasoning tokens recorded per request
